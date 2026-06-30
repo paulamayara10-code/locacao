@@ -5,8 +5,6 @@ import numpy as np
 import sqlite3
 from datetime import date, datetime
 from io import BytesIO
-import plotly.express as px
-import plotly.graph_objects as go
 
 # =========================================================
 # CONFIGURAÇÃO
@@ -577,26 +575,14 @@ if menu == "Visão Executiva":
         st.markdown('<div class="section-title">Painel de rentabilidade</div>', unsafe_allow_html=True)
         col1, col2 = st.columns(2)
         with col1:
-            fig = px.bar(
-                hist.head(12),
-                x="cliente",
-                y="lucro_liquido",
-                text="status",
-                title="Lucro líquido por simulação"
-            )
-            fig.update_layout(height=390, margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(fig, use_container_width=True)
+            st.markdown("**Lucro líquido por simulação**")
+            chart_df = hist.head(12)[["cliente", "lucro_liquido"]].copy()
+            chart_df = chart_df.set_index("cliente")
+            st.bar_chart(chart_df)
         with col2:
-            fig2 = px.scatter(
-                hist,
-                x="margem_liquida",
-                y="payback",
-                size="receita_total",
-                hover_name="cliente",
-                title="Margem x Payback"
-            )
-            fig2.update_layout(height=390, margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(fig2, use_container_width=True)
+            st.markdown("**Margem líquida x Payback**")
+            chart_df2 = hist[["margem_liquida", "payback"]].copy()
+            st.line_chart(chart_df2)
 
         st.markdown('<div class="section-title">Últimas operações</div>', unsafe_allow_html=True)
         st.dataframe(
@@ -770,13 +756,10 @@ elif menu == "1 - Cadastro da Operação":
 
         col1, col2 = st.columns(2)
         with col1:
-            fig = go.Figure()
-            fig.add_trace(go.Waterfall(
-                name="Resultado",
-                orientation="v",
-                measure=["relative", "relative", "relative", "relative", "relative", "relative", "total"],
-                x=["Receita total", "Aquisição", "Despesas", "Comissão", "Tributos", "Custo financeiro", "Lucro líquido"],
-                y=[
+            st.markdown("**Composição do resultado**")
+            comp_df = pd.DataFrame({
+                "Item": ["Receita total", "Aquisição", "Despesas", "Comissão", "Tributos", "Custo financeiro", "Lucro líquido"],
+                "Valor": [
                     resumo["receita_total"],
                     -valor_aquisicao,
                     -resumo["despesas_total"],
@@ -785,13 +768,11 @@ elif menu == "1 - Cadastro da Operação":
                     -resumo["custo_financeiro"],
                     resumo["lucro_liquido"],
                 ]
-            ))
-            fig.update_layout(title="Composição do resultado", height=420, margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(fig, use_container_width=True)
+            }).set_index("Item")
+            st.bar_chart(comp_df)
         with col2:
-            fig2 = px.line(fluxo_df, x="Mês", y="Saldo acumulado", title="Saldo acumulado da operação")
-            fig2.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(fig2, use_container_width=True)
+            st.markdown("**Saldo acumulado da operação**")
+            st.line_chart(fluxo_df.set_index("Mês")[["Saldo acumulado"]])
 
         st.markdown('<div class="section-title">Memorial de cálculo</div>', unsafe_allow_html=True)
         memorial = pd.DataFrame([
