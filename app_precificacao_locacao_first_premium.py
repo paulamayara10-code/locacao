@@ -20,8 +20,12 @@ st.set_page_config(
 DB_PATH = "simulacoes_locacao_first.db"
 
 IMPOSTO_LOCACAO_PADRAO = 14.30
-IRPJ_GANHO_CAPITAL_PADRAO = 15.00
+IRPJ_GANHO_CAPITAL_PADRAO = 25.00
 CSLL_GANHO_CAPITAL_PADRAO = 9.00
+ALIQUOTA_GANHO_CAPITAL_PADRAO = 34.00
+CBS_REFORMA_PADRAO = 8.80
+IBS_REFORMA_PADRAO = 17.70
+CREDITO_REFORMA_PADRAO = 100.00
 COMISSAO_VENDEDOR_PADRAO = 5.00
 COMISSAO_GERENTE_PADRAO = 0.50
 VIDA_UTIL_PADRAO = 10.0
@@ -53,6 +57,11 @@ def init_db():
             margem_locacao_venda REAL,
             impostos_locacao REAL,
             impostos_ganho_capital REAL,
+            tributos_reforma_bruto REAL,
+            credito_reforma REAL,
+            tributos_reforma_liquido REAL,
+            lucro_reforma_locacao REAL,
+            lucro_reforma_venda REAL,
             payback_locacao REAL,
             payback_locacao_venda REAL,
             status_locacao TEXT,
@@ -297,7 +306,7 @@ def calcular_operacao(p, interno=False):
         valor_venda_estimado = p["valor_venda_manual"]
 
     ganho_capital = valor_venda_estimado - valor_contabil_final
-    impostos_ganho_capital = max(ganho_capital, 0) * (p["irpj_ganho"] + p["csll_ganho"]) / 100
+    impostos_ganho_capital = max(ganho_capital, 0) * p["aliquota_ganho_capital"] / 100
 
     comissao_vendedor = receita_locacao * p["comissao_vendedor"] / 100
     comissao_gerente = receita_locacao * p["comissao_gerente"] / 100
@@ -305,6 +314,12 @@ def calcular_operacao(p, interno=False):
 
     impostos_locacao = receita_locacao * p["imposto_locacao"] / 100
     custo_financeiro = p["valor_aquisicao"] * (p["custo_financeiro_mensal"] / 100) * p["prazo"]
+
+    aliquota_reforma = p["cbs_reforma"] + p["ibs_reforma"]
+    base_credito_reforma = p["valor_aquisicao"] + despesas_total
+    credito_reforma = base_credito_reforma * aliquota_reforma / 100 * p["credito_reforma"] / 100
+    tributos_reforma_bruto_locacao = receita_locacao * aliquota_reforma / 100
+    tributos_reforma_liquido_locacao = max(tributos_reforma_bruto_locacao - credito_reforma, 0)
 
     lucro_locacao = (
         receita_locacao
@@ -328,6 +343,28 @@ def calcular_operacao(p, interno=False):
     payback_locacao = calcular_payback(saida_inicial, fluxo_mensal_locacao)
 
     receita_total_com_venda = receita_locacao + valor_venda_estimado
+    tributos_reforma_bruto_venda = receita_total_com_venda * aliquota_reforma / 100
+    tributos_reforma_liquido_venda = max(tributos_reforma_bruto_venda - credito_reforma, 0)
+
+    lucro_reforma_locacao = (
+        receita_locacao
+        - p["valor_aquisicao"]
+        - despesas_total
+        - comissao_total
+        - tributos_reforma_liquido_locacao
+        - custo_financeiro
+    )
+
+    lucro_reforma_venda = (
+        receita_total_com_venda
+        - p["valor_aquisicao"]
+        - despesas_total
+        - comissao_total
+        - tributos_reforma_liquido_venda
+        - impostos_ganho_capital
+        - custo_financeiro
+    )
+
     lucro_locacao_venda = (
         receita_total_com_venda
         - p["valor_aquisicao"]
@@ -390,7 +427,8 @@ def calcular_operacao(p, interno=False):
         f"Somente locação: {status_locacao.lower()}, margem {perc(margem_locacao)} e payback {meses(payback_locacao)}. "
         f"Locação com venda posterior: {status_venda.lower()}, margem {perc(margem_locacao_venda)} e payback {meses(payback_venda)}. "
         f"Ao final do contrato, o ativo estará {perc(percentual_depreciado)} depreciado, com valor contábil estimado de {moeda(valor_contabil_final)}. "
-        f"O valor de venda estimado é {moeda(valor_venda_estimado)} e o ganho de capital estimado é {moeda(ganho_capital)}."
+        f"O valor de venda estimado é {moeda(valor_venda_estimado)} e o ganho de capital estimado é {moeda(ganho_capital)}. "
+        f"No cenário pós-reforma, o tributo líquido estimado na operação com venda é {moeda(tributos_reforma_liquido_venda)}, considerando créditos estimados de {moeda(credito_reforma)}."
     )
 
     resumo = {
@@ -401,6 +439,11 @@ def calcular_operacao(p, interno=False):
         "percentual_depreciado": percentual_depreciado,
         "ganho_capital": ganho_capital,
         "impostos_ganho_capital": impostos_ganho_capital,
+        "tributos_reforma_bruto": tributos_reforma_bruto_venda,
+        "credito_reforma": credito_reforma,
+        "tributos_reforma_liquido": tributos_reforma_liquido_venda,
+        "lucro_reforma_locacao": lucro_reforma_locacao,
+        "lucro_reforma_venda": lucro_reforma_venda,
         "comissao_vendedor": comissao_vendedor,
         "comissao_gerente": comissao_gerente,
         "comissao_total": comissao_total,
@@ -458,6 +501,11 @@ def exportar_excel(p, resumo, fluxo_df, estrategia_df):
         ["Venda estimada", resumo["valor_venda_estimado"]],
         ["Ganho de capital", resumo["ganho_capital"]],
         ["Imposto ganho capital", resumo["impostos_ganho_capital"]],
+        ["IBS/CBS bruto pós-reforma", resumo["tributos_reforma_bruto"]],
+        ["Crédito estimado pós-reforma", resumo["credito_reforma"]],
+        ["IBS/CBS líquido pós-reforma", resumo["tributos_reforma_liquido"]],
+        ["Lucro pós-reforma locação", resumo["lucro_reforma_locacao"]],
+        ["Lucro pós-reforma locação + venda", resumo["lucro_reforma_venda"]],
         ["Lucro locação + venda", resumo["lucro_locacao_venda"]],
         ["Margem locação + venda", resumo["margem_locacao_venda"]],
         ["Payback locação + venda", resumo["payback_locacao_venda"]],
@@ -613,13 +661,18 @@ elif menu == "1 - Cadastro da Operação":
         with col4:
             outros_custos = input_moeda("Outros custos", 0.0, "outros_custos")
 
-        st.markdown('<div class="section-title">Comissões e impostos</div>', unsafe_allow_html=True)
-        col1, col2, col3, col4, col5 = st.columns(5)
+        st.markdown('<div class="section-title">Comissões e impostos atuais</div>', unsafe_allow_html=True)
+        col1, col2, col3, col4 = st.columns(4)
         comissao_vendedor = col1.number_input("Comissão vendedor (%)", min_value=0.0, value=COMISSAO_VENDEDOR_PADRAO, step=0.25)
         comissao_gerente = col2.number_input("Comissão gerente (%)", min_value=0.0, value=COMISSAO_GERENTE_PADRAO, step=0.25)
         imposto_locacao = col3.number_input("Imposto locação (%)", value=IMPOSTO_LOCACAO_PADRAO, step=0.10, disabled=True)
-        irpj_ganho = col4.number_input("IRPJ ganho capital (%)", value=IRPJ_GANHO_CAPITAL_PADRAO, step=0.50)
-        csll_ganho = col5.number_input("CSLL ganho capital (%)", value=CSLL_GANHO_CAPITAL_PADRAO, step=0.50)
+        aliquota_ganho_capital = col4.number_input("Ganho de capital (%)", value=ALIQUOTA_GANHO_CAPITAL_PADRAO, step=0.50)
+
+        st.markdown('<div class="section-title">Simulação pós-reforma</div>', unsafe_allow_html=True)
+        col1, col2, col3 = st.columns(3)
+        cbs_reforma = col1.number_input("CBS estimada (%)", value=CBS_REFORMA_PADRAO, step=0.10)
+        ibs_reforma = col2.number_input("IBS estimado (%)", value=IBS_REFORMA_PADRAO, step=0.10)
+        credito_reforma = col3.number_input("Crédito estimado sobre aquisição/despesas (%)", value=CREDITO_REFORMA_PADRAO, step=5.00)
 
         observacoes = st.text_area("Observações", height=80)
 
@@ -653,8 +706,10 @@ elif menu == "1 - Cadastro da Operação":
             comissao_vendedor=comissao_vendedor,
             comissao_gerente=comissao_gerente,
             imposto_locacao=IMPOSTO_LOCACAO_PADRAO,
-            irpj_ganho=irpj_ganho,
-            csll_ganho=csll_ganho,
+            aliquota_ganho_capital=aliquota_ganho_capital,
+            cbs_reforma=cbs_reforma,
+            ibs_reforma=ibs_reforma,
+            credito_reforma=credito_reforma,
             observacoes=observacoes
         )
 
@@ -693,6 +748,18 @@ elif menu == "1 - Cadastro da Operação":
             ("Valor contábil", moeda(resumo["valor_contabil_final"]), "Valor líquido contábil"),
             ("Ganho de capital", moeda(resumo["ganho_capital"]), "Venda - valor contábil"),
             ("Imposto ganho capital", moeda(resumo["impostos_ganho_capital"]), "IRPJ + CSLL"),
+        ]
+        for col, (label, value, help_text) in zip(cols, cards):
+            with col:
+                st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div><div class="metric-help">{help_text}</div></div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="section-title">Simulação pós-reforma</div>', unsafe_allow_html=True)
+        cols = st.columns(4)
+        cards = [
+            ("IBS/CBS bruto", moeda(resumo["tributos_reforma_bruto"]), "CBS + IBS sobre receita total"),
+            ("Crédito estimado", moeda(resumo["credito_reforma"]), "Aquisição/despesas"),
+            ("IBS/CBS líquido", moeda(resumo["tributos_reforma_liquido"]), "Após créditos"),
+            ("Lucro pós-reforma", moeda(resumo["lucro_reforma_venda"]), "Locação + venda"),
         ]
         for col, (label, value, help_text) in zip(cols, cards):
             with col:
@@ -751,6 +818,11 @@ elif menu == "1 - Cadastro da Operação":
                     "margem_locacao_venda": resumo["margem_locacao_venda"],
                     "impostos_locacao": resumo["impostos_locacao"],
                     "impostos_ganho_capital": resumo["impostos_ganho_capital"],
+                    "tributos_reforma_bruto": resumo["tributos_reforma_bruto"],
+                    "credito_reforma": resumo["credito_reforma"],
+                    "tributos_reforma_liquido": resumo["tributos_reforma_liquido"],
+                    "lucro_reforma_locacao": resumo["lucro_reforma_locacao"],
+                    "lucro_reforma_venda": resumo["lucro_reforma_venda"],
                     "payback_locacao": resumo["payback_locacao"],
                     "payback_locacao_venda": resumo["payback_locacao_venda"],
                     "status_locacao": resumo["status_locacao"],
@@ -809,7 +881,7 @@ elif menu == "2 - Precificação Reversa":
             venda_estimada = 0.0
 
         ganho = max(venda_estimada - valor_contabil, 0)
-        imposto_gc = ganho * (IRPJ_GANHO_CAPITAL_PADRAO + CSLL_GANHO_CAPITAL_PADRAO) / 100
+        imposto_gc = ganho * ALIQUOTA_GANHO_CAPITAL_PADRAO / 100
         custo_fin = valor * (custo_fin_mensal / 100) * prazo
 
         for aluguel in np.arange(1000, 200000, 100):
@@ -856,8 +928,10 @@ elif menu == "3 - Parâmetros":
         ["Vida útil padrão", "10 anos"],
         ["Impostos sobre locação", "14,30%"],
         ["Tributação da venda do ativo", "Ganho de capital"],
-        ["IRPJ ganho de capital", "15,00%"],
-        ["CSLL ganho de capital", "9,00%"],
+        ["Ganho de capital", "34,00%"],
+        ["CBS pós-reforma", "8,80%"],
+        ["IBS pós-reforma", "17,70%"],
+        ["Crédito base pós-reforma", "100% sobre aquisição/despesas (editável)"],
         ["Comissão vendedor", "5,00%"],
         ["Comissão gerente", "0,50%"],
         ["Valor de venda", "Estimado por prazo/depreciação, com opção manual"],
@@ -885,7 +959,7 @@ elif menu == "4 - Histórico":
                 money_cols=[
                     "valor_aquisicao", "aluguel_mensal", "valor_venda_estimado",
                     "valor_contabil_final", "ganho_capital", "lucro_locacao",
-                    "lucro_locacao_venda", "impostos_locacao", "impostos_ganho_capital"
+                    "lucro_locacao_venda", "impostos_locacao", "impostos_ganho_capital", "tributos_reforma_bruto", "credito_reforma", "tributos_reforma_liquido", "lucro_reforma_locacao", "lucro_reforma_venda"
                 ],
                 percent_cols=["percentual_depreciado", "margem_locacao", "margem_locacao_venda"],
                 month_cols=["payback_locacao", "payback_locacao_venda"]
