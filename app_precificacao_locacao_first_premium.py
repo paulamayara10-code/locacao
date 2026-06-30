@@ -15,6 +15,7 @@ st.set_page_config(
 
 DB_PATH = "simulacoes_locacao_first.db"
 IMPOSTO_ATUAL_PADRAO = 14.30
+IMPOSTO_VENDA_PADRAO = 14.30
 
 # =========================================================
 # BANCO DE DADOS
@@ -40,6 +41,7 @@ def init_db():
             valor_contabil_final REAL,
             ganho_capital REAL,
             tributos_atuais REAL,
+            tributos_venda REAL,
             tributos_reforma REAL,
             custo_financeiro REAL,
             lucro_liquido REAL,
@@ -52,6 +54,12 @@ def init_db():
         )
     """)
     conn.commit()
+
+    try:
+        conn.execute("ALTER TABLE simulacoes ADD COLUMN tributos_venda REAL DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
     conn.close()
 
 def salvar_simulacao(dados):
@@ -283,7 +291,9 @@ def calcular_operacao(p):
     comissao_gerente = base_comissao * p["perc_comissao_gerente"] / 100
     comissao_total = comissao_vendedor + comissao_gerente
 
-    tributos_atuais = receita_total * p["imposto_atual"] / 100
+    tributos_locacao = receita_locacao * p["imposto_atual"] / 100
+    tributos_venda = p["valor_residual"] * p["imposto_venda"] / 100 if p["considerar_venda"] else 0
+    tributos_atuais = tributos_locacao + tributos_venda
 
     rt_bruto = receita_total * (p["cbs"] + p["ibs"]) / 100
     rt_credito = rt_bruto * p["credito_rt"] / 100
@@ -310,17 +320,19 @@ def calcular_operacao(p):
     for m in range(1, int(p["prazo"]) + 1):
         receita_mes = p["aluguel_mensal"]
         venda_mes = p["valor_residual"] if m == p["prazo"] else 0
-        trib_mes = tributos_atuais / p["prazo"]
+        trib_mes = tributos_locacao / p["prazo"]
         desp_mes = (p["seguro"] + p["manutencao"] + p["despesas_indiretas"] + p["outras_despesas"]) / p["prazo"]
         com_mes = comissao_total / p["prazo"]
         custo_fin_mes = custo_financeiro / p["prazo"]
-        fluxo_mes = receita_mes + venda_mes - trib_mes - desp_mes - com_mes - custo_fin_mes
+        trib_venda_mes = tributos_venda if m == p["prazo"] else 0
+        fluxo_mes = receita_mes + venda_mes - trib_mes - trib_venda_mes - desp_mes - com_mes - custo_fin_mes
         saldo += fluxo_mes
         fluxo.append({
             "Mês": m,
             "Receita locação": receita_mes,
             "Venda final": venda_mes,
-            "Impostos": trib_mes,
+            "Impostos locação": trib_mes,
+            "Impostos venda": trib_venda_mes,
             "Despesas": desp_mes,
             "Comissão": com_mes,
             "Custo financeiro": custo_fin_mes,
@@ -358,6 +370,8 @@ def calcular_operacao(p):
         "comissao_vendedor": comissao_vendedor,
         "comissao_gerente": comissao_gerente,
         "comissao_total": comissao_total,
+        "tributos_locacao": tributos_locacao,
+        "tributos_venda": tributos_venda,
         "tributos_atuais": tributos_atuais,
         "tributos_reforma": tributos_reforma,
         "custo_financeiro": custo_financeiro,
@@ -381,7 +395,7 @@ def exportar_excel(p, resumo, fluxo_df):
         ["Valor de aquisição", p["valor_aquisicao"]],
         ["Despesas previstas", resumo["despesas_total"]],
         ["Comissão total", resumo["comissao_total"]],
-        ["Impostos atuais", resumo["tributos_atuais"]],
+        ["Impostos sobre locação", "Impostos sobre venda", "Impostos atuais", resumo["tributos_atuais"]],
         ["IBS/CBS simulado", resumo["tributos_reforma"]],
         ["Custo financeiro", resumo["custo_financeiro"]],
         ["Valor contábil final", resumo["valor_contabil_final"]],
@@ -419,7 +433,7 @@ menu = st.sidebar.radio(
     ]
 )
 st.sidebar.markdown("---")
-st.sidebar.caption("Lucro Presumido | Impostos atuais: 14,30%")
+st.sidebar.caption("Lucro Presumido | Locação 14,30% | Venda editável")
 
 # =========================================================
 # VISÃO EXECUTIVA
@@ -544,10 +558,14 @@ elif menu == "1 - Cadastro da Operação":
 
         st.markdown('<div class="section-title">Impostos</div>', unsafe_allow_html=True)
         col1, col2, col3, col4 = st.columns(4)
-        imposto_atual = col1.number_input("Impostos atuais incidentes (%)", value=IMPOSTO_ATUAL_PADRAO, step=0.10, disabled=True)
-        cbs = col2.number_input("CBS simulada (%)", value=0.90, step=0.10)
-        ibs = col3.number_input("IBS simulada (%)", value=0.10, step=0.10)
+        imposto_atual = col1.number_input("Impostos sobre locação (%)", value=IMPOSTO_ATUAL_PADRAO, step=0.10, disabled=True)
+        considerar_venda = col2.checkbox("Considerar venda final", value=True)
+        imposto_venda = col3.number_input("Impostos sobre venda (%)", value=IMPOSTO_VENDA_PADRAO, step=0.10)
         credito_rt = col4.number_input("Crédito estimado IBS/CBS (%)", value=0.00, step=0.50)
+
+        col1, col2 = st.columns(2)
+        cbs = col1.number_input("CBS simulada (%)", value=0.90, step=0.10)
+        ibs = col2.number_input("IBS simulada (%)", value=0.10, step=0.10)
 
         observacoes = st.text_area("Observações", height=80)
 
@@ -578,6 +596,8 @@ elif menu == "1 - Cadastro da Operação":
             perc_comissao_gerente=perc_comissao_gerente,
             base_comissao=base_comissao,
             imposto_atual=IMPOSTO_ATUAL_PADRAO,
+            considerar_venda=considerar_venda,
+            imposto_venda=imposto_venda,
             cbs=cbs,
             ibs=ibs,
             credito_rt=credito_rt,
@@ -609,7 +629,7 @@ elif menu == "1 - Cadastro da Operação":
         c1, c2, c3, c4 = st.columns(4)
         cards = [
             ("Ganho de capital", moeda(resumo["ganho_capital"]), "Venda final - valor contábil"),
-            ("Impostos atuais", moeda(resumo["tributos_atuais"]), "14,30% sobre receita total"),
+            ("Impostos sobre locação", "Impostos sobre venda", "Impostos atuais", moeda(resumo["tributos_atuais"]), "Locação + venda final"),
             ("IBS/CBS simulado", moeda(resumo["tributos_reforma"]), "Cenário editável"),
             ("Payback", meses(resumo["payback"]), "Retorno do investimento")
         ]
@@ -655,7 +675,9 @@ elif menu == "1 - Cadastro da Operação":
             ["Despesas previstas", resumo["despesas_total"]],
             ["Comissão vendedor", resumo["comissao_vendedor"]],
             ["Comissão gerente", resumo["comissao_gerente"]],
-            ["Impostos atuais", resumo["tributos_atuais"]],
+            ["Impostos sobre locação", resumo["tributos_locacao"]],
+            ["Impostos sobre venda", resumo["tributos_venda"]],
+            ["Impostos sobre locação", "Impostos sobre venda", "Impostos atuais", resumo["tributos_atuais"]],
             ["IBS/CBS simulado", resumo["tributos_reforma"]],
             ["Custo financeiro", resumo["custo_financeiro"]],
             ["Valor contábil final", resumo["valor_contabil_final"]],
@@ -669,7 +691,7 @@ elif menu == "1 - Cadastro da Operação":
         memorial_fmt = memorial.copy()
         money_indicators = [
             "Receita locação", "Venda final / residual", "Receita total", "Valor de aquisição",
-            "Despesas previstas", "Comissão vendedor", "Comissão gerente", "Impostos atuais",
+            "Despesas previstas", "Comissão vendedor", "Comissão gerente", "Impostos sobre locação", "Impostos sobre venda", "Impostos atuais",
             "IBS/CBS simulado", "Custo financeiro", "Valor contábil final", "Ganho de capital",
             "Lucro líquido"
         ]
@@ -688,7 +710,7 @@ elif menu == "1 - Cadastro da Operação":
         st.dataframe(
             formatar_df(
                 fluxo_df,
-                money_cols=["Receita locação", "Venda final", "Impostos", "Despesas", "Comissão", "Custo financeiro", "Fluxo líquido", "Saldo acumulado"]
+                money_cols=["Receita locação", "Venda final", "Impostos locação", "Impostos venda", "Despesas", "Comissão", "Custo financeiro", "Fluxo líquido", "Saldo acumulado"]
             ),
             use_container_width=True,
             hide_index=True
@@ -714,6 +736,7 @@ elif menu == "1 - Cadastro da Operação":
                     "valor_contabil_final": resumo["valor_contabil_final"],
                     "ganho_capital": resumo["ganho_capital"],
                     "tributos_atuais": resumo["tributos_atuais"],
+                    "tributos_venda": resumo["tributos_venda"],
                     "tributos_reforma": resumo["tributos_reforma"],
                     "custo_financeiro": resumo["custo_financeiro"],
                     "lucro_liquido": resumo["lucro_liquido"],
@@ -809,7 +832,8 @@ elif menu == "3 - Parâmetros":
     df = pd.DataFrame([
         ["Regime", "Lucro Presumido"],
         ["ISS", "Não considerado"],
-        ["Impostos atuais incidentes", "14,30%"],
+        ["Impostos sobre locação", "14,30%"],
+        ["Impostos sobre venda", "14,30% editável"],
         ["CBS padrão", "0,90%"],
         ["IBS padrão", "0,10%"],
         ["Histórico", "SQLite local"],
@@ -838,7 +862,7 @@ elif menu == "4 - Histórico":
                 money_cols=[
                     "valor_aquisicao", "aluguel_mensal", "valor_residual", "receita_total",
                     "despesas_total", "comissao_total", "valor_contabil_final", "ganho_capital",
-                    "tributos_atuais", "tributos_reforma", "custo_financeiro", "lucro_liquido",
+                    "tributos_atuais", "tributos_venda", "tributos_reforma", "custo_financeiro", "lucro_liquido",
                     "aluguel_minimo"
                 ],
                 percent_cols=["margem_liquida", "roi"],
