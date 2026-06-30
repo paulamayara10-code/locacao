@@ -14,8 +14,15 @@ st.set_page_config(
 )
 
 DB_PATH = "simulacoes_locacao_first.db"
-IMPOSTO_ATUAL_PADRAO = 14.30
-IMPOSTO_VENDA_PADRAO = 14.30
+
+# Padrões gerenciais
+IMPOSTO_LOCACAO_PADRAO = 14.30
+PIS_COFINS_VENDA_PADRAO = 3.65
+ICMS_VENDA_PADRAO = 18.00
+IRPJ_GANHO_CAPITAL_PADRAO = 15.00
+CSLL_GANHO_CAPITAL_PADRAO = 9.00
+COMISSAO_VENDEDOR_PADRAO = 5.00
+COMISSAO_GERENTE_PADRAO = 0.50
 
 # =========================================================
 # BANCO DE DADOS
@@ -35,31 +42,20 @@ def init_db():
             prazo INTEGER,
             aluguel_mensal REAL,
             valor_residual REAL,
-            receita_total REAL,
-            despesas_total REAL,
-            comissao_total REAL,
-            valor_contabil_final REAL,
+            lucro_locacao REAL,
+            margem_locacao REAL,
+            lucro_locacao_venda REAL,
+            margem_locacao_venda REAL,
             ganho_capital REAL,
-            tributos_atuais REAL,
-            tributos_venda REAL,
-            tributos_reforma REAL,
-            custo_financeiro REAL,
-            lucro_liquido REAL,
-            margem_liquida REAL,
-            roi REAL,
-            payback REAL,
-            aluguel_minimo REAL,
-            status TEXT,
+            impostos_locacao REAL,
+            impostos_venda REAL,
+            impostos_ganho_capital REAL,
+            status_locacao TEXT,
+            status_locacao_venda TEXT,
             parecer TEXT
         )
     """)
     conn.commit()
-
-    try:
-        conn.execute("ALTER TABLE simulacoes ADD COLUMN tributos_venda REAL DEFAULT 0")
-        conn.commit()
-    except Exception:
-        pass
     conn.close()
 
 def salvar_simulacao(dados):
@@ -174,7 +170,7 @@ st.markdown("""
     }
     .metric-value {
         color: #0B2F4A;
-        font-size: 1.48rem;
+        font-size: 1.43rem;
         font-weight: 850;
         margin-top: 8px;
         letter-spacing: -0.03em;
@@ -229,52 +225,37 @@ st.markdown("""
 # =========================================================
 # CÁLCULOS
 # =========================================================
-def classificar_status(margem_liquida, payback, prazo, lucro_liquido):
-    if lucro_liquido < 0 or margem_liquida < 8:
+def classificar_status(margem, lucro, payback, prazo):
+    if lucro < 0 or margem < 8:
         return "Crítica"
-    if margem_liquida < 18 or payback > prazo:
+    if margem < 18 or payback > prazo:
         return "Atenção"
     return "Saudável"
 
-def status_html(status):
+def status_html(status, titulo):
     if status == "Saudável":
-        return '<span class="pill-good">🟢 Operação saudável</span>'
+        return f'<span class="pill-good">🟢 {titulo}: saudável</span>'
     if status == "Atenção":
-        return '<span class="pill-warn">🟡 Revisar operação</span>'
-    return '<span class="pill-bad">🔴 Operação crítica</span>'
+        return f'<span class="pill-warn">🟡 {titulo}: revisar</span>'
+    return f'<span class="pill-bad">🔴 {titulo}: crítica</span>'
 
-def gerar_parecer(status, margem, payback, prazo, ganho_capital, lucro, aluguel, aluguel_minimo, tributos_atual, tributos_reforma):
-    if status == "Saudável":
-        texto = (
-            f"Operação recomendada nas premissas informadas. A margem líquida estimada é de {perc(margem)} "
-            f"e o investimento retorna em aproximadamente {meses(payback)}, dentro do prazo contratual de {prazo} meses."
-        )
-    elif status == "Atenção":
-        texto = (
-            f"Operação exige revisão antes da aprovação. A margem líquida estimada é de {perc(margem)} "
-            f"e o payback ficou em {meses(payback)} para um contrato de {prazo} meses."
-        )
-    else:
-        texto = (
-            f"Operação não recomendada nas premissas atuais. O lucro líquido estimado é {moeda(lucro)} "
-            f"e a margem líquida ficou em {perc(margem)}."
-        )
+def calcular_payback(saida_inicial, fluxo_mensal):
+    if fluxo_mensal <= 0:
+        return 999
+    return saida_inicial / fluxo_mensal
 
-    if aluguel_minimo > 0 and aluguel < aluguel_minimo:
-        texto += f" O aluguel informado está abaixo do mínimo sugerido de {moeda(aluguel_minimo)}."
-    elif aluguel_minimo > 0:
-        texto += f" O aluguel informado está acima do mínimo sugerido de {moeda(aluguel_minimo)}."
+def calcular_aluguel_minimo(p, considerar_venda):
+    for aluguel in np.arange(1000, 150000, 100):
+        pp = p.copy()
+        pp["aluguel_mensal"] = float(aluguel)
+        r, _ = calcular_operacao(pp, interno=True)
+        margem = r["margem_locacao_venda"] if considerar_venda else r["margem_locacao"]
+        if margem >= p["margem_desejada"]:
+            return float(aluguel)
+    return 0
 
-    if ganho_capital > 0:
-        texto += f" A venda final gera ganho de capital estimado de {moeda(ganho_capital)}."
-
-    texto += f" Impostos atuais considerados: {moeda(tributos_atual)}. IBS/CBS simulado: {moeda(tributos_reforma)}."
-
-    return texto
-
-def calcular_operacao(p):
+def calcular_operacao(p, interno=False):
     receita_locacao = p["aluguel_mensal"] * p["prazo"]
-    receita_total = receita_locacao + p["valor_residual"]
 
     despesas_total = (
         p["frete"] + p["instalacao"] + p["seguro"] + p["manutencao"] +
@@ -286,133 +267,162 @@ def calcular_operacao(p):
     valor_contabil_final = max(p["valor_aquisicao"] - depreciacao_acumulada, 0)
     ganho_capital = p["valor_residual"] - valor_contabil_final
 
-    base_comissao = receita_locacao if p["base_comissao"] == "Receita de locação" else receita_total
-    comissao_vendedor = base_comissao * p["perc_comissao_vendedor"] / 100
-    comissao_gerente = base_comissao * p["perc_comissao_gerente"] / 100
-    comissao_total = comissao_vendedor + comissao_gerente
+    comissao_locacao = receita_locacao * (p["perc_comissao_vendedor"] + p["perc_comissao_gerente"]) / 100
+    comissao_vendedor = receita_locacao * p["perc_comissao_vendedor"] / 100
+    comissao_gerente = receita_locacao * p["perc_comissao_gerente"] / 100
 
-    tributos_locacao = receita_locacao * p["imposto_atual"] / 100
-    tributos_venda = p["valor_residual"] * p["imposto_venda"] / 100 if p["considerar_venda"] else 0
-    tributos_atuais = tributos_locacao + tributos_venda
-
-    rt_bruto = receita_total * (p["cbs"] + p["ibs"]) / 100
-    rt_credito = rt_bruto * p["credito_rt"] / 100
-    tributos_reforma = max(rt_bruto - rt_credito, 0)
+    impostos_locacao = receita_locacao * p["imposto_locacao"] / 100
 
     custo_financeiro = p["valor_aquisicao"] * (p["custo_financeiro_mensal"] / 100) * p["prazo"]
 
-    lucro_liquido = receita_total - p["valor_aquisicao"] - despesas_total - comissao_total - tributos_atuais - custo_financeiro
-    margem_liquida = (lucro_liquido / receita_total * 100) if receita_total else 0
-    roi = (lucro_liquido / p["valor_aquisicao"] * 100) if p["valor_aquisicao"] else 0
+    # CENÁRIO 1: SOMENTE LOCAÇÃO
+    receita_total_locacao = receita_locacao
+    lucro_locacao = receita_locacao - p["valor_aquisicao"] - despesas_total - comissao_locacao - impostos_locacao - custo_financeiro
+    margem_locacao = lucro_locacao / receita_total_locacao * 100 if receita_total_locacao else 0
 
-    saida_inicial = p["valor_aquisicao"] + p["frete"] + p["instalacao"]
-    entrada_mensal_aprox = (
+    fluxo_mensal_locacao = (
         p["aluguel_mensal"]
-        - (tributos_atuais / p["prazo"])
-        - ((p["seguro"] + p["manutencao"] + p["despesas_indiretas"] + p["outras_despesas"]) / p["prazo"])
-        - (comissao_total / p["prazo"])
-        - (custo_financeiro / p["prazo"])
+        - impostos_locacao / p["prazo"]
+        - despesas_total / p["prazo"]
+        - comissao_locacao / p["prazo"]
+        - custo_financeiro / p["prazo"]
     )
-    payback = saida_inicial / entrada_mensal_aprox if entrada_mensal_aprox > 0 else 999
+    payback_locacao = calcular_payback(p["valor_aquisicao"] + p["frete"] + p["instalacao"], fluxo_mensal_locacao)
+
+    # CENÁRIO 2: LOCAÇÃO + VENDA POSTERIOR
+    receita_total_venda = receita_locacao + p["valor_residual"]
+
+    impostos_venda = p["valor_residual"] * (p["pis_cofins_venda"] + p["icms_venda"]) / 100 if p["valor_residual"] > 0 else 0
+    impostos_ganho_capital = max(ganho_capital, 0) * (p["irpj_ganho"] + p["csll_ganho"]) / 100
+
+    lucro_locacao_venda = (
+        receita_total_venda
+        - p["valor_aquisicao"]
+        - despesas_total
+        - comissao_locacao
+        - impostos_locacao
+        - impostos_venda
+        - impostos_ganho_capital
+        - custo_financeiro
+    )
+    margem_locacao_venda = lucro_locacao_venda / receita_total_venda * 100 if receita_total_venda else 0
+
+    fluxo_mensal_base = fluxo_mensal_locacao
+    payback_locacao_venda = payback_locacao
+    if fluxo_mensal_base > 0:
+        saldo = -(p["valor_aquisicao"] + p["frete"] + p["instalacao"])
+        payback_locacao_venda = 999
+        for m in range(1, int(p["prazo"]) + 1):
+            saldo += fluxo_mensal_base
+            if m == p["prazo"]:
+                saldo += p["valor_residual"] - impostos_venda - impostos_ganho_capital
+            if saldo >= 0:
+                payback_locacao_venda = m
+                break
+
+    status_locacao = classificar_status(margem_locacao, lucro_locacao, payback_locacao, p["prazo"])
+    status_locacao_venda = classificar_status(margem_locacao_venda, lucro_locacao_venda, payback_locacao_venda, p["prazo"])
+
+    # IBS/CBS apenas comparativo gerencial sobre receitas
+    rt_locacao = receita_locacao * (p["cbs"] + p["ibs"]) / 100
+    rt_locacao_venda = receita_total_venda * (p["cbs"] + p["ibs"]) / 100
+
+    aluguel_minimo_locacao = 0 if interno else calcular_aluguel_minimo(p, considerar_venda=False)
+    aluguel_minimo_locacao_venda = 0 if interno else calcular_aluguel_minimo(p, considerar_venda=True)
+
+    parecer = (
+        f"Somente locação: {status_locacao.lower()}, margem {perc(margem_locacao)} e payback {meses(payback_locacao)}. "
+        f"Locação com venda posterior: {status_locacao_venda.lower()}, margem {perc(margem_locacao_venda)} e payback {meses(payback_locacao_venda)}. "
+        f"A venda posterior considera impostos sobre a venda de {moeda(impostos_venda)} e tributação estimada sobre ganho de capital de {moeda(impostos_ganho_capital)}."
+    )
 
     fluxo = []
-    saldo = -saida_inicial
+    saldo_loc = -(p["valor_aquisicao"] + p["frete"] + p["instalacao"])
+    saldo_venda = saldo_loc
     for m in range(1, int(p["prazo"]) + 1):
-        receita_mes = p["aluguel_mensal"]
         venda_mes = p["valor_residual"] if m == p["prazo"] else 0
-        trib_mes = tributos_locacao / p["prazo"]
-        desp_mes = (p["seguro"] + p["manutencao"] + p["despesas_indiretas"] + p["outras_despesas"]) / p["prazo"]
-        com_mes = comissao_total / p["prazo"]
-        custo_fin_mes = custo_financeiro / p["prazo"]
-        trib_venda_mes = tributos_venda if m == p["prazo"] else 0
-        fluxo_mes = receita_mes + venda_mes - trib_mes - trib_venda_mes - desp_mes - com_mes - custo_fin_mes
-        saldo += fluxo_mes
+        imposto_venda_mes = impostos_venda if m == p["prazo"] else 0
+        imposto_gc_mes = impostos_ganho_capital if m == p["prazo"] else 0
+
+        fluxo_loc = fluxo_mensal_base
+        fluxo_venda = fluxo_mensal_base + venda_mes - imposto_venda_mes - imposto_gc_mes
+
+        saldo_loc += fluxo_loc
+        saldo_venda += fluxo_venda
+
         fluxo.append({
             "Mês": m,
-            "Receita locação": receita_mes,
+            "Fluxo somente locação": fluxo_loc,
+            "Saldo somente locação": saldo_loc,
             "Venda final": venda_mes,
-            "Impostos locação": trib_mes,
-            "Impostos venda": trib_venda_mes,
-            "Despesas": desp_mes,
-            "Comissão": com_mes,
-            "Custo financeiro": custo_fin_mes,
-            "Fluxo líquido": fluxo_mes,
-            "Saldo acumulado": saldo
+            "Impostos venda": imposto_venda_mes,
+            "Impostos ganho capital": imposto_gc_mes,
+            "Fluxo locação + venda": fluxo_venda,
+            "Saldo locação + venda": saldo_venda
         })
-
-    aluguel_minimo = 0
-    for aluguel in np.arange(1000, 150000, 100):
-        receita_loc = aluguel * p["prazo"]
-        receita_tot = receita_loc + p["valor_residual"]
-        base_com = receita_loc if p["base_comissao"] == "Receita de locação" else receita_tot
-        com = base_com * (p["perc_comissao_vendedor"] + p["perc_comissao_gerente"]) / 100
-        trib = receita_tot * p["imposto_atual"] / 100
-        lucro = receita_tot - p["valor_aquisicao"] - despesas_total - com - trib - custo_financeiro
-        margem = lucro / receita_tot * 100 if receita_tot else 0
-        if margem >= p["margem_desejada"]:
-            aluguel_minimo = float(aluguel)
-            break
-
-    status = classificar_status(margem_liquida, payback, p["prazo"], lucro_liquido)
-    parecer = gerar_parecer(
-        status, margem_liquida, payback, p["prazo"], ganho_capital,
-        lucro_liquido, p["aluguel_mensal"], aluguel_minimo,
-        tributos_atuais, tributos_reforma
-    )
 
     resumo = {
         "receita_locacao": receita_locacao,
-        "receita_total": receita_total,
+        "receita_total_locacao": receita_total_locacao,
+        "receita_total_venda": receita_total_venda,
         "despesas_total": despesas_total,
         "depreciacao_acumulada": depreciacao_acumulada,
         "valor_contabil_final": valor_contabil_final,
         "ganho_capital": ganho_capital,
         "comissao_vendedor": comissao_vendedor,
         "comissao_gerente": comissao_gerente,
-        "comissao_total": comissao_total,
-        "tributos_locacao": tributos_locacao,
-        "tributos_venda": tributos_venda,
-        "tributos_atuais": tributos_atuais,
-        "tributos_reforma": tributos_reforma,
+        "comissao_total": comissao_locacao,
+        "impostos_locacao": impostos_locacao,
+        "impostos_venda": impostos_venda,
+        "impostos_ganho_capital": impostos_ganho_capital,
         "custo_financeiro": custo_financeiro,
-        "lucro_liquido": lucro_liquido,
-        "margem_liquida": margem_liquida,
-        "roi": roi,
-        "payback": payback,
-        "aluguel_minimo": aluguel_minimo,
-        "status": status,
+        "lucro_locacao": lucro_locacao,
+        "margem_locacao": margem_locacao,
+        "payback_locacao": payback_locacao,
+        "lucro_locacao_venda": lucro_locacao_venda,
+        "margem_locacao_venda": margem_locacao_venda,
+        "payback_locacao_venda": payback_locacao_venda,
+        "roi_locacao": lucro_locacao / p["valor_aquisicao"] * 100 if p["valor_aquisicao"] else 0,
+        "roi_locacao_venda": lucro_locacao_venda / p["valor_aquisicao"] * 100 if p["valor_aquisicao"] else 0,
+        "status_locacao": status_locacao,
+        "status_locacao_venda": status_locacao_venda,
+        "rt_locacao": rt_locacao,
+        "rt_locacao_venda": rt_locacao_venda,
+        "aluguel_minimo_locacao": aluguel_minimo_locacao,
+        "aluguel_minimo_locacao_venda": aluguel_minimo_locacao_venda,
         "parecer": parecer
     }
+
     return resumo, pd.DataFrame(fluxo)
 
 def exportar_excel(p, resumo, fluxo_df):
     output = BytesIO()
     premissas = pd.DataFrame([p])
     memorial = pd.DataFrame([
-        ["Receita total da locação", resumo["receita_locacao"]],
-        ["Valor residual / venda final", p["valor_residual"]],
-        ["Receita total da operação", resumo["receita_total"]],
+        ["Receita locação", resumo["receita_locacao"]],
         ["Valor de aquisição", p["valor_aquisicao"]],
         ["Despesas previstas", resumo["despesas_total"]],
-        ["Comissão total", resumo["comissao_total"]],
-        ["Impostos sobre locação", "Impostos sobre venda", "Impostos atuais", resumo["tributos_atuais"]],
-        ["IBS/CBS simulado", resumo["tributos_reforma"]],
+        ["Comissão vendedor", resumo["comissao_vendedor"]],
+        ["Comissão gerente", resumo["comissao_gerente"]],
+        ["Impostos locação", resumo["impostos_locacao"]],
         ["Custo financeiro", resumo["custo_financeiro"]],
+        ["Lucro somente locação", resumo["lucro_locacao"]],
+        ["Margem somente locação", resumo["margem_locacao"]],
+        ["Payback somente locação", resumo["payback_locacao"]],
+        ["Venda final / residual", p["valor_residual"]],
         ["Valor contábil final", resumo["valor_contabil_final"]],
         ["Ganho de capital", resumo["ganho_capital"]],
-        ["Lucro líquido", resumo["lucro_liquido"]],
-        ["Margem líquida (%)", resumo["margem_liquida"]],
-        ["ROI (%)", resumo["roi"]],
-        ["Payback", resumo["payback"]],
-        ["Aluguel mínimo sugerido", resumo["aluguel_minimo"]],
-        ["Status", resumo["status"]],
-        ["Parecer", resumo["parecer"]],
+        ["Impostos venda", resumo["impostos_venda"]],
+        ["Impostos ganho capital", resumo["impostos_ganho_capital"]],
+        ["Lucro locação + venda", resumo["lucro_locacao_venda"]],
+        ["Margem locação + venda", resumo["margem_locacao_venda"]],
+        ["Payback locação + venda", resumo["payback_locacao_venda"]],
     ], columns=["Indicador", "Valor"])
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         premissas.to_excel(writer, index=False, sheet_name="Premissas")
         memorial.to_excel(writer, index=False, sheet_name="Memorial")
-        fluxo_df.to_excel(writer, index=False, sheet_name="Fluxo Mensal")
+        fluxo_df.to_excel(writer, index=False, sheet_name="Fluxo")
     output.seek(0)
     return output
 
@@ -433,7 +443,7 @@ menu = st.sidebar.radio(
     ]
 )
 st.sidebar.markdown("---")
-st.sidebar.caption("Lucro Presumido | Locação 14,30% | Venda editável")
+st.sidebar.caption("Cenários separados: locação | locação + venda")
 
 # =========================================================
 # VISÃO EXECUTIVA
@@ -441,21 +451,21 @@ st.sidebar.caption("Lucro Presumido | Locação 14,30% | Venda editável")
 if menu == "Visão Executiva":
     st.markdown("""
     <div class="hero">
-        <h1>Precificação de Locação com Opção de Compra</h1>
-        <p>Margem, impostos, ganho de capital, payback e aluguel mínimo recomendado.</p>
+        <h1>Precificação de Locação</h1>
+        <p>Simulação separada entre locação pura e locação com venda posterior.</p>
     </div>
     """, unsafe_allow_html=True)
 
     hist = carregar_historico()
     if hist.empty:
-        c1, c2, c3, c4 = st.columns(4)
+        cols = st.columns(4)
         cards = [
             ("Simulações", "0", "Histórico vazio"),
-            ("Receita projetada", moeda(0), "Sem operações salvas"),
-            ("Margem média", "0,00%", "Sem dados"),
-            ("Operações críticas", "0", "Sem dados")
+            ("Lucro médio locação", moeda(0), "Sem dados"),
+            ("Lucro médio com venda", moeda(0), "Sem dados"),
+            ("Operações críticas", "0", "Sem dados"),
         ]
-        for col, (label, value, help_text) in zip([c1, c2, c3, c4], cards):
+        for col, (label, value, help_text) in zip(cols, cards):
             with col:
                 st.markdown(f"""
                 <div class="metric-card">
@@ -465,14 +475,14 @@ if menu == "Visão Executiva":
                 </div>
                 """, unsafe_allow_html=True)
     else:
-        c1, c2, c3, c4 = st.columns(4)
+        cols = st.columns(4)
         cards = [
             ("Simulações", len(hist), "Operações salvas"),
-            ("Receita projetada", moeda(hist["receita_total"].sum()), "Locação + venda"),
-            ("Margem média", perc(hist["margem_liquida"].mean()), "Média do histórico"),
-            ("Operações críticas", int((hist["status"] == "Crítica").sum()), "Revisar")
+            ("Lucro médio locação", moeda(hist["lucro_locacao"].mean()), "Sem venda residual"),
+            ("Lucro médio com venda", moeda(hist["lucro_locacao_venda"].mean()), "Com venda posterior"),
+            ("Operações críticas", int(((hist["status_locacao"] == "Crítica") | (hist["status_locacao_venda"] == "Crítica")).sum()), "Revisar"),
         ]
-        for col, (label, value, help_text) in zip([c1, c2, c3, c4], cards):
+        for col, (label, value, help_text) in zip(cols, cards):
             with col:
                 st.markdown(f"""
                 <div class="metric-card">
@@ -482,23 +492,17 @@ if menu == "Visão Executiva":
                 </div>
                 """, unsafe_allow_html=True)
 
-        st.markdown('<div class="section-title">Rentabilidade</div>', unsafe_allow_html=True)
-        col1, col2 = st.columns(2)
-        with col1:
-            chart_df = hist.head(12)[["cliente", "lucro_liquido"]].set_index("cliente")
-            st.bar_chart(chart_df)
-        with col2:
-            chart_df2 = hist.head(12)[["cliente", "margem_liquida"]].set_index("cliente")
-            st.bar_chart(chart_df2)
+        st.markdown('<div class="section-title">Comparativo de lucro</div>', unsafe_allow_html=True)
+        chart_df = hist.head(12)[["cliente", "lucro_locacao", "lucro_locacao_venda"]].set_index("cliente")
+        st.bar_chart(chart_df)
 
         st.markdown('<div class="section-title">Últimas simulações</div>', unsafe_allow_html=True)
-        view = hist[["data_hora", "cliente", "equipamento", "prazo", "aluguel_mensal", "valor_residual", "lucro_liquido", "margem_liquida", "payback", "status"]].head(15)
+        view = hist[["data_hora", "cliente", "equipamento", "prazo", "aluguel_mensal", "valor_residual", "lucro_locacao", "margem_locacao", "lucro_locacao_venda", "margem_locacao_venda"]].head(15)
         st.dataframe(
             formatar_df(
                 view,
-                money_cols=["aluguel_mensal", "valor_residual", "lucro_liquido"],
-                percent_cols=["margem_liquida"],
-                month_cols=["payback"]
+                money_cols=["aluguel_mensal", "valor_residual", "lucro_locacao", "lucro_locacao_venda"],
+                percent_cols=["margem_locacao", "margem_locacao_venda"]
             ),
             use_container_width=True,
             hide_index=True
@@ -511,7 +515,7 @@ elif menu == "1 - Cadastro da Operação":
     st.markdown("""
     <div class="hero">
         <h1>Cadastro da Operação</h1>
-        <p>Preencha as premissas e calcule a viabilidade da locação.</p>
+        <p>O app calcula separadamente: somente locação e locação com venda posterior.</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -532,7 +536,7 @@ elif menu == "1 - Cadastro da Operação":
         valor_aquisicao = col1.number_input("Valor de aquisição (R$)", min_value=0.0, value=400000.0, step=1000.0, format="%.2f")
         prazo = col2.number_input("Prazo da locação (meses)", min_value=1, value=24, step=1)
         aluguel_mensal = col3.number_input("Aluguel mensal (R$)", min_value=0.0, value=18000.0, step=500.0, format="%.2f")
-        valor_residual = col4.number_input("Venda final / residual (R$)", min_value=0.0, value=180000.0, step=1000.0, format="%.2f")
+        valor_residual = col4.number_input("Venda final / residual (R$)", min_value=0.0, value=0.0, step=1000.0, format="%.2f")
 
         col1, col2, col3 = st.columns(3)
         vida_util_anos = col1.number_input("Vida útil para depreciação (anos)", min_value=1.0, value=10.0, step=0.5)
@@ -551,21 +555,22 @@ elif menu == "1 - Cadastro da Operação":
         outras_despesas = col2.number_input("Outras despesas (R$)", min_value=0.0, value=0.0, step=100.0, format="%.2f")
 
         st.markdown('<div class="section-title">Comissionamento</div>', unsafe_allow_html=True)
-        col1, col2, col3 = st.columns(3)
-        perc_comissao_vendedor = col1.number_input("Comissão vendedor (%)", min_value=0.0, value=3.0, step=0.25)
-        perc_comissao_gerente = col2.number_input("Comissão gerente (%)", min_value=0.0, value=1.0, step=0.25)
-        base_comissao = col3.selectbox("Base da comissão", ["Receita de locação", "Receita total locação + residual"])
+        col1, col2 = st.columns(2)
+        perc_comissao_vendedor = col1.number_input("Comissão vendedor (%)", min_value=0.0, value=COMISSAO_VENDEDOR_PADRAO, step=0.25)
+        perc_comissao_gerente = col2.number_input("Comissão gerente (%)", min_value=0.0, value=COMISSAO_GERENTE_PADRAO, step=0.25)
 
         st.markdown('<div class="section-title">Impostos</div>', unsafe_allow_html=True)
         col1, col2, col3, col4 = st.columns(4)
-        imposto_atual = col1.number_input("Impostos sobre locação (%)", value=IMPOSTO_ATUAL_PADRAO, step=0.10, disabled=True)
-        considerar_venda = col2.checkbox("Considerar venda final", value=True)
-        imposto_venda = col3.number_input("Impostos sobre venda (%)", value=IMPOSTO_VENDA_PADRAO, step=0.10)
-        credito_rt = col4.number_input("Crédito estimado IBS/CBS (%)", value=0.00, step=0.50)
+        imposto_locacao = col1.number_input("Impostos sobre locação (%)", value=IMPOSTO_LOCACAO_PADRAO, step=0.10, disabled=True)
+        pis_cofins_venda = col2.number_input("PIS/COFINS venda (%)", value=PIS_COFINS_VENDA_PADRAO, step=0.10)
+        icms_venda = col3.number_input("ICMS venda (%)", value=ICMS_VENDA_PADRAO, step=0.10)
+        irpj_ganho = col4.number_input("IRPJ ganho capital (%)", value=IRPJ_GANHO_CAPITAL_PADRAO, step=0.50)
 
-        col1, col2 = st.columns(2)
-        cbs = col1.number_input("CBS simulada (%)", value=0.90, step=0.10)
-        ibs = col2.number_input("IBS simulada (%)", value=0.10, step=0.10)
+        col1, col2, col3, col4 = st.columns(4)
+        csll_ganho = col1.number_input("CSLL ganho capital (%)", value=CSLL_GANHO_CAPITAL_PADRAO, step=0.50)
+        cbs = col2.number_input("CBS simulada (%)", value=0.90, step=0.10)
+        ibs = col3.number_input("IBS simulada (%)", value=0.10, step=0.10)
+        credito_rt = col4.number_input("Crédito estimado IBS/CBS (%)", value=0.00, step=0.50)
 
         observacoes = st.text_area("Observações", height=80)
 
@@ -594,10 +599,11 @@ elif menu == "1 - Cadastro da Operação":
             outras_despesas=outras_despesas,
             perc_comissao_vendedor=perc_comissao_vendedor,
             perc_comissao_gerente=perc_comissao_gerente,
-            base_comissao=base_comissao,
-            imposto_atual=IMPOSTO_ATUAL_PADRAO,
-            considerar_venda=considerar_venda,
-            imposto_venda=imposto_venda,
+            imposto_locacao=IMPOSTO_LOCACAO_PADRAO,
+            pis_cofins_venda=pis_cofins_venda,
+            icms_venda=icms_venda,
+            irpj_ganho=irpj_ganho,
+            csll_ganho=csll_ganho,
             cbs=cbs,
             ibs=ibs,
             credito_rt=credito_rt,
@@ -606,15 +612,15 @@ elif menu == "1 - Cadastro da Operação":
 
         resumo, fluxo_df = calcular_operacao(p)
 
-        st.markdown('<div class="section-title">Resultado</div>', unsafe_allow_html=True)
-        st.markdown(status_html(resumo["status"]), unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Resultado — somente locação</div>', unsafe_allow_html=True)
+        st.markdown(status_html(resumo["status_locacao"], "Somente locação"), unsafe_allow_html=True)
 
         c1, c2, c3, c4 = st.columns(4)
         cards = [
-            ("Receita total", moeda(resumo["receita_total"]), "Locação + venda final"),
-            ("Lucro líquido", moeda(resumo["lucro_liquido"]), "Resultado estimado"),
-            ("Margem líquida", perc(resumo["margem_liquida"]), "Lucro sobre receita"),
-            ("Aluguel mínimo", moeda(resumo["aluguel_minimo"]), "Para a margem desejada")
+            ("Receita locação", moeda(resumo["receita_locacao"]), "Sem venda residual"),
+            ("Lucro locação", moeda(resumo["lucro_locacao"]), "Resultado sem venda"),
+            ("Margem locação", perc(resumo["margem_locacao"]), "Lucro sobre aluguel"),
+            ("Aluguel mínimo", moeda(resumo["aluguel_minimo_locacao"]), "Para margem desejada"),
         ]
         for col, (label, value, help_text) in zip([c1, c2, c3, c4], cards):
             with col:
@@ -628,10 +634,47 @@ elif menu == "1 - Cadastro da Operação":
 
         c1, c2, c3, c4 = st.columns(4)
         cards = [
-            ("Ganho de capital", moeda(resumo["ganho_capital"]), "Venda final - valor contábil"),
-            ("Impostos sobre locação", "Impostos sobre venda", "Impostos atuais", moeda(resumo["tributos_atuais"]), "Locação + venda final"),
-            ("IBS/CBS simulado", moeda(resumo["tributos_reforma"]), "Cenário editável"),
-            ("Payback", meses(resumo["payback"]), "Retorno do investimento")
+            ("Impostos locação", moeda(resumo["impostos_locacao"]), "14,30% sobre aluguel"),
+            ("Comissão total", moeda(resumo["comissao_total"]), "5% vendedor + 0,5% gerente"),
+            ("Custo financeiro", moeda(resumo["custo_financeiro"]), "Capital investido"),
+            ("Payback locação", meses(resumo["payback_locacao"]), "Retorno sem venda"),
+        ]
+        for col, (label, value, help_text) in zip([c1, c2, c3, c4], cards):
+            with col:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">{label}</div>
+                    <div class="metric-value">{value}</div>
+                    <div class="metric-help">{help_text}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown('<div class="section-title">Resultado — locação + venda posterior</div>', unsafe_allow_html=True)
+        st.markdown(status_html(resumo["status_locacao_venda"], "Locação + venda"), unsafe_allow_html=True)
+
+        c1, c2, c3, c4 = st.columns(4)
+        cards = [
+            ("Receita total", moeda(resumo["receita_total_venda"]), "Locação + venda"),
+            ("Lucro total", moeda(resumo["lucro_locacao_venda"]), "Resultado com venda"),
+            ("Margem total", perc(resumo["margem_locacao_venda"]), "Lucro sobre receita total"),
+            ("Aluguel mínimo", moeda(resumo["aluguel_minimo_locacao_venda"]), "Para margem desejada"),
+        ]
+        for col, (label, value, help_text) in zip([c1, c2, c3, c4], cards):
+            with col:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">{label}</div>
+                    <div class="metric-value">{value}</div>
+                    <div class="metric-help">{help_text}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        c1, c2, c3, c4 = st.columns(4)
+        cards = [
+            ("Valor contábil final", moeda(resumo["valor_contabil_final"]), "Após depreciação"),
+            ("Ganho de capital", moeda(resumo["ganho_capital"]), "Venda - valor contábil"),
+            ("Impostos venda", moeda(resumo["impostos_venda"]), "PIS/COFINS + ICMS"),
+            ("Impostos ganho capital", moeda(resumo["impostos_ganho_capital"]), "IRPJ + CSLL"),
         ]
         for col, (label, value, help_text) in zip([c1, c2, c3, c4], cards):
             with col:
@@ -646,80 +689,68 @@ elif menu == "1 - Cadastro da Operação":
         st.markdown('<div class="section-title">Parecer</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="parecer">{resumo["parecer"]}</div>', unsafe_allow_html=True)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown('<div class="section-title">Composição do resultado</div>', unsafe_allow_html=True)
-            comp = pd.DataFrame({
-                "Item": ["Receita total", "Aquisição", "Despesas", "Comissão", "Impostos", "Custo financeiro", "Lucro líquido"],
-                "Valor": [
-                    resumo["receita_total"],
-                    -valor_aquisicao,
-                    -resumo["despesas_total"],
-                    -resumo["comissao_total"],
-                    -resumo["tributos_atuais"],
-                    -resumo["custo_financeiro"],
-                    resumo["lucro_liquido"],
-                ]
-            }).set_index("Item")
-            st.bar_chart(comp)
-        with col2:
-            st.markdown('<div class="section-title">Saldo acumulado</div>', unsafe_allow_html=True)
-            st.line_chart(fluxo_df.set_index("Mês")[["Saldo acumulado"]])
-
-        st.markdown('<div class="section-title">Memorial</div>', unsafe_allow_html=True)
-        memorial = pd.DataFrame([
-            ["Receita locação", resumo["receita_locacao"]],
-            ["Venda final / residual", valor_residual],
-            ["Receita total", resumo["receita_total"]],
-            ["Valor de aquisição", valor_aquisicao],
-            ["Despesas previstas", resumo["despesas_total"]],
-            ["Comissão vendedor", resumo["comissao_vendedor"]],
-            ["Comissão gerente", resumo["comissao_gerente"]],
-            ["Impostos sobre locação", resumo["tributos_locacao"]],
-            ["Impostos sobre venda", resumo["tributos_venda"]],
-            ["Impostos sobre locação", "Impostos sobre venda", "Impostos atuais", resumo["tributos_atuais"]],
-            ["IBS/CBS simulado", resumo["tributos_reforma"]],
-            ["Custo financeiro", resumo["custo_financeiro"]],
-            ["Valor contábil final", resumo["valor_contabil_final"]],
-            ["Ganho de capital", resumo["ganho_capital"]],
-            ["Lucro líquido", resumo["lucro_liquido"]],
-            ["Margem líquida", resumo["margem_liquida"]],
-            ["ROI", resumo["roi"]],
-            ["Payback", resumo["payback"]],
-        ], columns=["Indicador", "Valor"])
-
-        memorial_fmt = memorial.copy()
-        money_indicators = [
-            "Receita locação", "Venda final / residual", "Receita total", "Valor de aquisição",
-            "Despesas previstas", "Comissão vendedor", "Comissão gerente", "Impostos sobre locação", "Impostos sobre venda", "Impostos atuais",
-            "IBS/CBS simulado", "Custo financeiro", "Valor contábil final", "Ganho de capital",
-            "Lucro líquido"
-        ]
-        percent_indicators = ["Margem líquida", "ROI"]
-        month_indicators = ["Payback"]
-        memorial_fmt["Valor"] = memorial_fmt.apply(
-            lambda row: moeda(row["Valor"]) if row["Indicador"] in money_indicators
-            else perc(row["Valor"]) if row["Indicador"] in percent_indicators
-            else meses(row["Valor"]) if row["Indicador"] in month_indicators
-            else row["Valor"],
-            axis=1
-        )
-        st.dataframe(memorial_fmt, use_container_width=True, hide_index=True)
+        st.markdown('<div class="section-title">Comparativo de saldo</div>', unsafe_allow_html=True)
+        st.line_chart(fluxo_df.set_index("Mês")[["Saldo somente locação", "Saldo locação + venda"]])
 
         st.markdown('<div class="section-title">Fluxo mensal</div>', unsafe_allow_html=True)
         st.dataframe(
             formatar_df(
                 fluxo_df,
-                money_cols=["Receita locação", "Venda final", "Impostos locação", "Impostos venda", "Despesas", "Comissão", "Custo financeiro", "Fluxo líquido", "Saldo acumulado"]
+                money_cols=[
+                    "Fluxo somente locação", "Saldo somente locação", "Venda final",
+                    "Impostos venda", "Impostos ganho capital", "Fluxo locação + venda",
+                    "Saldo locação + venda"
+                ]
             ),
             use_container_width=True,
             hide_index=True
         )
 
+        memorial = pd.DataFrame([
+            ["Receita locação", resumo["receita_locacao"]],
+            ["Valor de aquisição", valor_aquisicao],
+            ["Despesas previstas", resumo["despesas_total"]],
+            ["Comissão vendedor", resumo["comissao_vendedor"]],
+            ["Comissão gerente", resumo["comissao_gerente"]],
+            ["Impostos locação", resumo["impostos_locacao"]],
+            ["Custo financeiro", resumo["custo_financeiro"]],
+            ["Lucro somente locação", resumo["lucro_locacao"]],
+            ["Margem somente locação", resumo["margem_locacao"]],
+            ["Payback somente locação", resumo["payback_locacao"]],
+            ["Venda final / residual", valor_residual],
+            ["Valor contábil final", resumo["valor_contabil_final"]],
+            ["Ganho de capital", resumo["ganho_capital"]],
+            ["Impostos venda", resumo["impostos_venda"]],
+            ["Impostos ganho capital", resumo["impostos_ganho_capital"]],
+            ["Lucro locação + venda", resumo["lucro_locacao_venda"]],
+            ["Margem locação + venda", resumo["margem_locacao_venda"]],
+            ["Payback locação + venda", resumo["payback_locacao_venda"]],
+        ], columns=["Indicador", "Valor"])
+
+        money_ind = [
+            "Receita locação", "Valor de aquisição", "Despesas previstas", "Comissão vendedor",
+            "Comissão gerente", "Impostos locação", "Custo financeiro", "Lucro somente locação",
+            "Venda final / residual", "Valor contábil final", "Ganho de capital", "Impostos venda",
+            "Impostos ganho capital", "Lucro locação + venda"
+        ]
+        perc_ind = ["Margem somente locação", "Margem locação + venda"]
+        mes_ind = ["Payback somente locação", "Payback locação + venda"]
+        memorial_fmt = memorial.copy()
+        memorial_fmt["Valor"] = memorial_fmt.apply(
+            lambda row: moeda(row["Valor"]) if row["Indicador"] in money_ind
+            else perc(row["Valor"]) if row["Indicador"] in perc_ind
+            else meses(row["Valor"]) if row["Indicador"] in mes_ind
+            else row["Valor"],
+            axis=1
+        )
+
+        st.markdown('<div class="section-title">Memorial</div>', unsafe_allow_html=True)
+        st.dataframe(memorial_fmt, use_container_width=True, hide_index=True)
+
         col1, col2 = st.columns(2)
         with col1:
             if st.button("Salvar no histórico", use_container_width=True):
-                dados_db = {
+                salvar_simulacao({
                     "data_hora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
                     "cliente": p["cliente"],
                     "equipamento": p["equipamento"],
@@ -730,24 +761,18 @@ elif menu == "1 - Cadastro da Operação":
                     "prazo": p["prazo"],
                     "aluguel_mensal": p["aluguel_mensal"],
                     "valor_residual": p["valor_residual"],
-                    "receita_total": resumo["receita_total"],
-                    "despesas_total": resumo["despesas_total"],
-                    "comissao_total": resumo["comissao_total"],
-                    "valor_contabil_final": resumo["valor_contabil_final"],
+                    "lucro_locacao": resumo["lucro_locacao"],
+                    "margem_locacao": resumo["margem_locacao"],
+                    "lucro_locacao_venda": resumo["lucro_locacao_venda"],
+                    "margem_locacao_venda": resumo["margem_locacao_venda"],
                     "ganho_capital": resumo["ganho_capital"],
-                    "tributos_atuais": resumo["tributos_atuais"],
-                    "tributos_venda": resumo["tributos_venda"],
-                    "tributos_reforma": resumo["tributos_reforma"],
-                    "custo_financeiro": resumo["custo_financeiro"],
-                    "lucro_liquido": resumo["lucro_liquido"],
-                    "margem_liquida": resumo["margem_liquida"],
-                    "roi": resumo["roi"],
-                    "payback": resumo["payback"],
-                    "aluguel_minimo": resumo["aluguel_minimo"],
-                    "status": resumo["status"],
+                    "impostos_locacao": resumo["impostos_locacao"],
+                    "impostos_venda": resumo["impostos_venda"],
+                    "impostos_ganho_capital": resumo["impostos_ganho_capital"],
+                    "status_locacao": resumo["status_locacao"],
+                    "status_locacao_venda": resumo["status_locacao_venda"],
                     "parecer": resumo["parecer"]
-                }
-                salvar_simulacao(dados_db)
+                })
                 st.success("Simulação salva.")
         with col2:
             excel = exportar_excel(p, resumo, fluxo_df)
@@ -766,32 +791,42 @@ elif menu == "2 - Precificação Reversa":
     st.markdown("""
     <div class="hero">
         <h1>Precificação Reversa</h1>
-        <p>Informe a margem desejada e encontre o aluguel mínimo sugerido.</p>
+        <p>Calcula o aluguel mínimo para locação pura ou locação com venda posterior.</p>
     </div>
     """, unsafe_allow_html=True)
+
+    tipo = st.radio("Cenário", ["Somente locação", "Locação + venda posterior"], horizontal=True)
 
     col1, col2, col3 = st.columns(3)
     valor = col1.number_input("Valor do equipamento (R$)", value=400000.0, step=1000.0, format="%.2f")
     prazo = col2.number_input("Prazo (meses)", value=24, step=1)
-    residual = col3.number_input("Venda final / residual (R$)", value=180000.0, step=1000.0, format="%.2f")
+    residual = col3.number_input("Venda final / residual (R$)", value=0.0 if tipo == "Somente locação" else 180000.0, step=1000.0, format="%.2f")
 
     col1, col2, col3 = st.columns(3)
     despesas = col1.number_input("Despesas totais (R$)", value=30000.0, step=1000.0, format="%.2f")
-    comissao = col2.number_input("Comissão total (%)", value=4.0, step=0.25)
+    comissao = col2.number_input("Comissão total (%)", value=5.50, step=0.25)
     margem = col3.number_input("Margem desejada (%)", value=20.0, step=1.0)
 
-    col1, col2 = st.columns(2)
-    imposto = col1.number_input("Impostos atuais incidentes (%)", value=IMPOSTO_ATUAL_PADRAO, step=0.10, disabled=True)
-    custo_fin = col2.number_input("Custo financeiro total (R$)", value=80000.0, step=1000.0, format="%.2f")
+    col1, col2, col3 = st.columns(3)
+    imposto_loc = col1.number_input("Impostos locação (%)", value=IMPOSTO_LOCACAO_PADRAO, disabled=True)
+    imposto_venda = col2.number_input("Impostos venda (%)", value=PIS_COFINS_VENDA_PADRAO + ICMS_VENDA_PADRAO, step=0.10)
+    imposto_gc = col3.number_input("IRPJ/CSLL ganho capital (%)", value=IRPJ_GANHO_CAPITAL_PADRAO + CSLL_GANHO_CAPITAL_PADRAO, step=0.50)
+
+    custo_fin = st.number_input("Custo financeiro total (R$)", value=80000.0, step=1000.0, format="%.2f")
 
     if st.button("Calcular aluguel mínimo", use_container_width=True):
         resultado = None
         for aluguel in np.arange(1000, 150000, 100):
             receita_loc = aluguel * prazo
-            receita_total = receita_loc + residual
-            trib = receita_total * IMPOSTO_ATUAL_PADRAO / 100
-            com = receita_total * comissao / 100
-            lucro = receita_total - valor - despesas - trib - com - custo_fin
+            receita_total = receita_loc + (residual if tipo == "Locação + venda posterior" else 0)
+            trib_loc = receita_loc * IMPOSTO_LOCACAO_PADRAO / 100
+            trib_venda = residual * imposto_venda / 100 if tipo == "Locação + venda posterior" else 0
+            # Simplificação: ganho de capital estimado como residual menos valor depreciado padrão 10 anos.
+            valor_contabil = max(valor - (valor / (10 * 12) * prazo), 0)
+            ganho = max(residual - valor_contabil, 0)
+            trib_gc = ganho * imposto_gc / 100 if tipo == "Locação + venda posterior" else 0
+            com = receita_loc * comissao / 100
+            lucro = receita_total - valor - despesas - trib_loc - trib_venda - trib_gc - com - custo_fin
             margem_calc = lucro / receita_total * 100 if receita_total else 0
             if margem_calc >= margem:
                 resultado = (aluguel, receita_total, lucro, margem_calc)
@@ -802,9 +837,9 @@ elif menu == "2 - Precificação Reversa":
             c1, c2, c3, c4 = st.columns(4)
             cards = [
                 ("Aluguel mínimo", moeda(aluguel), "Valor mensal sugerido"),
-                ("Receita total", moeda(receita_total), "Locação + venda"),
-                ("Lucro estimado", moeda(lucro), "Resultado da operação"),
-                ("Margem estimada", perc(margem_calc), "Margem atingida")
+                ("Receita total", moeda(receita_total), "Conforme cenário"),
+                ("Lucro estimado", moeda(lucro), "Resultado gerencial"),
+                ("Margem estimada", perc(margem_calc), "Margem atingida"),
             ]
             for col, (label, value, help_text) in zip([c1, c2, c3, c4], cards):
                 with col:
@@ -825,7 +860,7 @@ elif menu == "3 - Parâmetros":
     st.markdown("""
     <div class="hero">
         <h1>Parâmetros</h1>
-        <p>Configuração usada nas simulações.</p>
+        <p>Premissas padrão usadas no app.</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -833,10 +868,14 @@ elif menu == "3 - Parâmetros":
         ["Regime", "Lucro Presumido"],
         ["ISS", "Não considerado"],
         ["Impostos sobre locação", "14,30%"],
-        ["Impostos sobre venda", "14,30% editável"],
+        ["PIS/COFINS venda", "3,65%"],
+        ["ICMS venda", "18,00%"],
+        ["IRPJ ganho de capital", "15,00%"],
+        ["CSLL ganho de capital", "9,00%"],
+        ["Comissão vendedor", "5,00%"],
+        ["Comissão gerente", "0,50%"],
         ["CBS padrão", "0,90%"],
         ["IBS padrão", "0,10%"],
-        ["Histórico", "SQLite local"],
     ], columns=["Parâmetro", "Valor"])
     st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -855,18 +894,15 @@ elif menu == "4 - Histórico":
     if hist.empty:
         st.info("Nenhuma simulação salva.")
     else:
-        view = hist.copy()
         st.dataframe(
             formatar_df(
-                view,
+                hist,
                 money_cols=[
-                    "valor_aquisicao", "aluguel_mensal", "valor_residual", "receita_total",
-                    "despesas_total", "comissao_total", "valor_contabil_final", "ganho_capital",
-                    "tributos_atuais", "tributos_venda", "tributos_reforma", "custo_financeiro", "lucro_liquido",
-                    "aluguel_minimo"
+                    "valor_aquisicao", "aluguel_mensal", "valor_residual",
+                    "lucro_locacao", "lucro_locacao_venda", "ganho_capital",
+                    "impostos_locacao", "impostos_venda", "impostos_ganho_capital"
                 ],
-                percent_cols=["margem_liquida", "roi"],
-                month_cols=["payback"]
+                percent_cols=["margem_locacao", "margem_locacao_venda"]
             ),
             use_container_width=True,
             hide_index=True
