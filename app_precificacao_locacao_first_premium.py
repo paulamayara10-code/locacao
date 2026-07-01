@@ -6,6 +6,7 @@ import sqlite3
 from datetime import date, datetime
 from io import BytesIO
 import re
+import os
 
 # ======================================================
 # CONFIGURAÇÃO
@@ -153,6 +154,83 @@ def formatar_df(df, money_cols=None, percent_cols=None, month_cols=None):
         if col in df_fmt.columns:
             df_fmt[col] = df_fmt[col].apply(meses)
     return df_fmt
+
+
+# ======================================================
+# BASE DE ATIVOS / ATFR010
+# ======================================================
+def normalizar_base_ativos(arquivo):
+    try:
+        if str(arquivo).lower().endswith('.csv'):
+            df = pd.read_csv(arquivo)
+            return df
+    except Exception:
+        pass
+
+    df_raw = pd.read_excel(arquivo, sheet_name=0, header=1)
+    colmap = {
+        'Cod. do Bem': 'cod_bem',
+        'Item': 'item',
+        'Dt.Aquisicao': 'data_aquisicao',
+        'Descr. Sint.': 'descricao',
+        'Patrimonio': 'patrimonio',
+        'Num de Serie': 'num_serie',
+        'Status Bem': 'status',
+        'Vl Aquisicao': 'valor_aquisicao',
+        'Cod. Produto': 'cod_produto',
+        'Marca': 'marca',
+        'Serie': 'serie',
+        'Dt Calibr': 'dt_calibracao',
+        'Dt Venciment': 'dt_vencimento',
+    }
+    cols = [c for c in colmap if c in df_raw.columns]
+    df = df_raw[cols].rename(columns=colmap).copy()
+    return limpar_base_ativos(df)
+
+def limpar_base_ativos(df):
+    df = df.copy()
+    for c in ['cod_bem','item','descricao','patrimonio','num_serie','status','cod_produto','marca','serie']:
+        if c not in df.columns:
+            df[c] = ''
+        df[c] = df[c].fillna('').astype(str).str.strip()
+    if 'valor_aquisicao' not in df.columns:
+        df['valor_aquisicao'] = 0.0
+    df['valor_aquisicao'] = pd.to_numeric(df['valor_aquisicao'], errors='coerce').fillna(0.0)
+    for c in ['data_aquisicao','dt_calibracao','dt_vencimento']:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors='coerce')
+        else:
+            df[c] = pd.NaT
+    df = df[(df['cod_bem'] != '') | (df['descricao'] != '')]
+    df['label'] = df.apply(lambda r: f"{r.get('cod_bem','')} | {r.get('patrimonio','')} | {r.get('descricao','')} | {moeda(r.get('valor_aquisicao',0))}", axis=1)
+    return df.reset_index(drop=True)
+
+def carregar_ativos_padrao():
+    caminhos = ['ativos_pre_cadastro.csv', '/mnt/data/ativos_pre_cadastro.csv', 'atfr010.xlsx', 'atfr010(1).xlsx']
+    for caminho in caminhos:
+        if os.path.exists(caminho):
+            try:
+                if caminho.lower().endswith('.csv'):
+                    return limpar_base_ativos(pd.read_csv(caminho))
+                return normalizar_base_ativos(caminho)
+            except Exception:
+                pass
+    return pd.DataFrame()
+
+def idade_meses(data_aquisicao, data_ref=None):
+    if data_ref is None:
+        data_ref = pd.Timestamp(date.today())
+    dt = pd.to_datetime(data_aquisicao, errors='coerce')
+    if pd.isna(dt):
+        return 0
+    return max((data_ref.year - dt.year) * 12 + (data_ref.month - dt.month), 0)
+
+def calcular_depreciacao_atual_ativo(valor, data_aquisicao, vida_util_anos=VIDA_UTIL_PADRAO):
+    meses_uso = idade_meses(data_aquisicao)
+    vida_meses = vida_util_anos * 12
+    perc_dep = min(meses_uso / vida_meses, 1) * 100 if vida_meses else 0
+    valor_contabil = max(valor * (1 - perc_dep / 100), 0)
+    return meses_uso, perc_dep, valor_contabil
 
 # ======================================================
 # ESTILO PREMIUM
@@ -533,11 +611,29 @@ menu = st.sidebar.radio(
         "1 - Cadastro da Operação",
         "2 - Precificação Reversa",
         "3 - Parâmetros",
-        "4 - Histórico"
+        "4 - Histórico",
+        "5 - Ativos"
     ]
 )
 st.sidebar.markdown("---")
 st.sidebar.caption("Locação | Venda posterior | Ganho de capital")
+
+if "ativos_df" not in st.session_state:
+    st.session_state.ativos_df = carregar_ativos_padrao()
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Base de ativos")
+upload_ativos = st.sidebar.file_uploader("Importar ATFR010 / ativos", type=["xlsx", "csv"])
+if upload_ativos is not None:
+    try:
+        st.session_state.ativos_df = normalizar_base_ativos(upload_ativos)
+        st.sidebar.success(f"{len(st.session_state.ativos_df)} ativos carregados")
+    except Exception as e:
+        st.sidebar.error(f"Não consegui ler a base: {e}")
+elif not st.session_state.ativos_df.empty:
+    st.sidebar.success(f"{len(st.session_state.ativos_df)} ativos pré-carregados")
+else:
+    st.sidebar.info("Sem base de ativos carregada")
 
 # ======================================================
 # VISÃO EXECUTIVA
@@ -606,6 +702,34 @@ elif menu == "1 - Cadastro da Operação":
     </div>
     """, unsafe_allow_html=True)
 
+    ativo_selecionado = None
+    ativos_df = st.session_state.get("ativos_df", pd.DataFrame())
+    if not ativos_df.empty:
+        st.markdown('<div class="section-title">Ativo pré-cadastrado</div>', unsafe_allow_html=True)
+        busca_ativo = st.text_input("Buscar ativo por código, patrimônio, descrição, série ou marca", "")
+        ativos_filtrados = ativos_df.copy()
+        if busca_ativo.strip():
+            termo = busca_ativo.strip().lower()
+            mask = (
+                ativos_filtrados['cod_bem'].str.lower().str.contains(termo, na=False) |
+                ativos_filtrados['patrimonio'].str.lower().str.contains(termo, na=False) |
+                ativos_filtrados['descricao'].str.lower().str.contains(termo, na=False) |
+                ativos_filtrados['num_serie'].str.lower().str.contains(termo, na=False) |
+                ativos_filtrados['marca'].str.lower().str.contains(termo, na=False)
+            )
+            ativos_filtrados = ativos_filtrados[mask]
+        lista_labels = ["Digitar manualmente"] + ativos_filtrados.head(300)['label'].tolist()
+        escolha_ativo = st.selectbox("Selecionar ativo", lista_labels)
+        if escolha_ativo != "Digitar manualmente":
+            idx = ativos_filtrados[ativos_filtrados['label'] == escolha_ativo].index[0]
+            ativo_selecionado = ativos_filtrados.loc[idx].to_dict()
+            meses_uso, dep_atual, vl_contabil_atual = calcular_depreciacao_atual_ativo(ativo_selecionado.get('valor_aquisicao', 0), ativo_selecionado.get('data_aquisicao'), VIDA_UTIL_PADRAO)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Código", ativo_selecionado.get('cod_bem', ''))
+            c2.metric("Aquisição", moeda(ativo_selecionado.get('valor_aquisicao', 0)))
+            c3.metric("Depreciação atual", perc(dep_atual))
+            c4.metric("Valor contábil atual", moeda(vl_contabil_atual))
+
     with st.form("form_operacao"):
         st.markdown('<div class="section-title">Dados comerciais</div>', unsafe_allow_html=True)
         col1, col2, col3 = st.columns(3)
@@ -614,23 +738,24 @@ elif menu == "1 - Cadastro da Operação":
         gerente = col3.text_input("Gerente")
 
         col1, col2, col3 = st.columns(3)
-        equipamento = col1.text_input("Equipamento")
-        fabricante = col2.text_input("Fabricante / linha")
+        equipamento = col1.text_input("Equipamento", value=(ativo_selecionado.get("descricao", "") if ativo_selecionado else ""))
+        fabricante = col2.text_input("Fabricante / linha", value=(ativo_selecionado.get("marca", "") if ativo_selecionado else ""))
         data_sim = col3.date_input("Data", value=date.today())
 
         st.markdown('<div class="section-title">Contrato e ativo</div>', unsafe_allow_html=True)
         col1, col2, col3 = st.columns(3)
         with col1:
-            valor_aquisicao = input_moeda("Valor de aquisição", 400000.0, "valor_aquisicao")
+            valor_aquisicao = input_moeda("Valor de aquisição", float(ativo_selecionado.get("valor_aquisicao", 400000.0)) if ativo_selecionado else 400000.0, "valor_aquisicao")
         with col2:
             prazo = st.number_input("Prazo da locação (meses)", min_value=1, value=24, step=1)
         with col3:
             aluguel_mensal = input_moeda("Aluguel mensal", 18000.0, "aluguel_mensal")
 
         col1, col2, col3 = st.columns(3)
-        vida_util_anos = col1.number_input("Vida útil para depreciação (anos)", min_value=1.0, value=VIDA_UTIL_PADRAO, step=0.5)
-        custo_financeiro_mensal = col2.number_input("Custo financeiro mensal (%)", min_value=0.0, value=1.2, step=0.1)
-        margem_desejada = col3.number_input("Margem líquida desejada (%)", min_value=0.0, value=20.0, step=1.0)
+        data_aquisicao_ativo = col1.date_input("Data de aquisição", value=(pd.to_datetime(ativo_selecionado.get("data_aquisicao")).date() if ativo_selecionado and not pd.isna(ativo_selecionado.get("data_aquisicao")) else date.today()))
+        vida_util_anos = col2.number_input("Vida útil para depreciação (anos)", min_value=1.0, value=VIDA_UTIL_PADRAO, step=0.5)
+        custo_financeiro_mensal = col3.number_input("Custo financeiro mensal (%)", min_value=0.0, value=1.2, step=0.1)
+        margem_desejada = st.number_input("Margem líquida desejada (%)", min_value=0.0, value=20.0, step=1.0)
 
         st.markdown('<div class="section-title">Venda posterior</div>', unsafe_allow_html=True)
         col1, col2, col3 = st.columns(3)
@@ -686,6 +811,9 @@ elif menu == "1 - Cadastro da Operação":
             equipamento=equipamento or "Equipamento não informado",
             fabricante=fabricante,
             data_sim=str(data_sim),
+            cod_bem=(ativo_selecionado.get("cod_bem", "") if ativo_selecionado else ""),
+            patrimonio=(ativo_selecionado.get("patrimonio", "") if ativo_selecionado else ""),
+            data_aquisicao=str(data_aquisicao_ativo),
             valor_aquisicao=valor_aquisicao,
             prazo=int(prazo),
             aluguel_mensal=aluguel_mensal,
@@ -986,3 +1114,57 @@ elif menu == "4 - Histórico":
                     st.success("Histórico limpo.")
                 else:
                     st.error("Senha inválida.")
+
+
+# ======================================================
+# ATIVOS
+# ======================================================
+elif menu == "5 - Ativos":
+    st.markdown("""
+    <div class="hero">
+        <h1>Ativos Pré-cadastrados</h1>
+        <p>Base ATFR010 para consulta de aquisição, valor contábil estimado e depreciação.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    ativos_df = st.session_state.get("ativos_df", pd.DataFrame())
+    if ativos_df.empty:
+        st.info("Importe a base ATFR010 no menu lateral para consultar os ativos.")
+    else:
+        termo = st.text_input("Buscar", "")
+        view = ativos_df.copy()
+        if termo.strip():
+            t = termo.strip().lower()
+            mask = (
+                view['cod_bem'].str.lower().str.contains(t, na=False) |
+                view['patrimonio'].str.lower().str.contains(t, na=False) |
+                view['descricao'].str.lower().str.contains(t, na=False) |
+                view['num_serie'].str.lower().str.contains(t, na=False) |
+                view['marca'].str.lower().str.contains(t, na=False)
+            )
+            view = view[mask]
+
+        dep = view.apply(lambda r: calcular_depreciacao_atual_ativo(r.get('valor_aquisicao', 0), r.get('data_aquisicao'), VIDA_UTIL_PADRAO), axis=1)
+        if len(view):
+            view = view.copy()
+            view['idade_meses'] = [x[0] for x in dep]
+            view['depreciacao_atual'] = [x[1] for x in dep]
+            view['valor_contabil_atual'] = [x[2] for x in dep]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Ativos", len(view))
+        c2.metric("Valor aquisição", moeda(view['valor_aquisicao'].sum() if 'valor_aquisicao' in view else 0))
+        c3.metric("Valor contábil estimado", moeda(view['valor_contabil_atual'].sum() if 'valor_contabil_atual' in view else 0))
+        c4.metric("Totalmente depreciados", int((view['depreciacao_atual'] >= 100).sum()) if 'depreciacao_atual' in view else 0)
+
+        cols = ['cod_bem','patrimonio','descricao','marca','num_serie','status','data_aquisicao','valor_aquisicao','idade_meses','depreciacao_atual','valor_contabil_atual']
+        cols = [c for c in cols if c in view.columns]
+        st.dataframe(
+            formatar_df(
+                view[cols].head(1000),
+                money_cols=['valor_aquisicao','valor_contabil_atual'],
+                percent_cols=['depreciacao_atual']
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
