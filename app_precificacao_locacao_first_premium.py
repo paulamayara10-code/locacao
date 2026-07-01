@@ -495,7 +495,8 @@ def calcular_operacao(p, interno=False):
     if usar_financiamento:
         custo_financeiro = custo_total_financiamento
     else:
-        custo_financeiro = p["valor_aquisicao"] * (p["custo_financeiro_mensal"] / 100) * p["prazo"]
+        # Ativo próprio: não aplicar custo financeiro automático.
+        custo_financeiro = 0.0
 
     aliquota_reforma = p["cbs_reforma"] + p["ibs_reforma"]
     base_credito_reforma = p["valor_aquisicao"] + despesas_total
@@ -890,7 +891,7 @@ elif menu == "1 - Cadastro da Operação":
         data_aquisicao_padrao = (pd.to_datetime(ativo_selecionado.get("data_aquisicao")).date() if ativo_selecionado and not pd.isna(ativo_selecionado.get("data_aquisicao")) else date.today())
         data_aquisicao_ativo = col1.date_input("Data de aquisição", value=data_aquisicao_padrao, key=f"data_aquisicao_{ativo_key}")
         vida_util_anos = col2.number_input("Vida útil para depreciação (anos)", min_value=1.0, value=VIDA_UTIL_PADRAO, step=0.5)
-        custo_financeiro_mensal = col3.number_input("Custo financeiro mensal (%)", min_value=0.0, value=1.6, step=0.1)
+        custo_financeiro_mensal = col3.number_input("Custo financeiro mensal sem financiamento (%)", min_value=0.0, value=0.0, step=0.1)
         margem_desejada = st.number_input("Margem líquida desejada (%)", min_value=0.0, value=25.0, step=1.0)
 
         st.markdown('<div class="section-title">Venda posterior</div>', unsafe_allow_html=True)
@@ -940,6 +941,14 @@ elif menu == "1 - Cadastro da Operação":
         submitted = st.form_submit_button("Calcular", use_container_width=True)
 
     if submitted:
+        # Segurança: se o bloco de financiamento não carregar por algum ajuste de versão,
+        # o app assume ativo próprio, sem custo financeiro.
+        usar_financiamento = locals().get("usar_financiamento", False)
+        valor_financiado = locals().get("valor_financiado", 0.0)
+        taxa_financiamento = locals().get("taxa_financiamento", TAXA_FINANCIAMENTO_PADRAO)
+        prazo_financiamento = locals().get("prazo_financiamento", PRAZO_FINANCIAMENTO_PADRAO)
+        aliquota_ganho_capital = locals().get("aliquota_ganho_capital", ALIQUOTA_GANHO_CAPITAL_PADRAO)
+
         p = dict(
             cliente=cliente or "Cliente não informado",
             vendedor=vendedor,
@@ -1134,7 +1143,7 @@ elif menu == "2 - Precificação Reversa":
     col1, col2, col3 = st.columns(3)
     vida = col1.number_input("Vida útil (anos)", value=VIDA_UTIL_PADRAO, step=0.5)
     fator = col2.number_input("Fator de mercado (%)", value=100.0, step=5.0)
-    custo_fin_mensal = col3.number_input("Custo financeiro mensal (%)", value=1.6, step=0.1)
+    custo_fin_mensal = col3.number_input("Custo financeiro mensal sem financiamento (%)", value=0.0, step=0.1)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -1196,9 +1205,9 @@ elif menu == "3 - Parâmetros":
         ["Regime", "Lucro Presumido"],
         ["ISS", "Não considerado"],
         ["Vida útil padrão", "10 anos"],
-        ["Custo financeiro padrão", "1,60% ao mês"],
+        ["Custo financeiro padrão", "0,00% para ativo próprio"],
         ["Margem desejada padrão", "25,00%"],
-        ["Financiamento bancário", "Tabela Price, taxa e prazo editáveis"],
+        ["Financiamento bancário", "Tabela Price; padrão 1,60% a.m. quando utilizado"],
         ["Impostos sobre locação", "14,30%"],
         ["Tributação da venda do ativo", "Ganho de capital"],
         ["Ganho de capital", "34,00%"],
