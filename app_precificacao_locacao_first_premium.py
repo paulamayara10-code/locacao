@@ -529,17 +529,25 @@ elif menu == "1 - Cadastro da Operação":
 
         col1, col2, col3 = st.columns(3)
         vida_util_anos = col1.number_input("Vida útil para depreciação (anos)", min_value=1.0, value=VIDA_UTIL_PADRAO, step=0.5)
-        col2.text_input("Custo financeiro do ativo próprio", value="R$ 0,00", disabled=True)
         margem_desejada = col3.number_input("Margem líquida desejada (%)", min_value=0.0, value=25.0, step=1.0)
 
         st.markdown('<div class="section-title">Origem do investimento</div>', unsafe_allow_html=True)
-        origem_investimento = st.radio("Selecione a origem", ["Capital próprio", "Financiamento bancário"], horizontal=True)
+        origem_investimento = st.radio(
+            "Selecione a origem",
+            ["Capital próprio", "Financiamento bancário"],
+            horizontal=True,
+            key="origem_investimento_radio"
+        )
+
+        # Padrão: capital próprio. Nenhum campo de financiamento aparece nesse caso.
         banco_financiamento = ""
         entrada_financiamento = 0.0
         valor_financiado = 0.0
         taxa_financiamento = TAXA_FINANCIAMENTO_PADRAO
         prazo_financiamento = PRAZO_FINANCIAMENTO_PADRAO
+
         if origem_investimento == "Financiamento bancário":
+            st.markdown('<div class="section-title">Dados do financiamento</div>', unsafe_allow_html=True)
             col1, col2, col3, col4 = st.columns(4)
             banco_financiamento = col1.text_input("Banco")
             with col2:
@@ -547,10 +555,12 @@ elif menu == "1 - Cadastro da Operação":
             with col3:
                 valor_financiado = input_moeda("Valor financiado", max(valor_aquisicao - entrada_financiamento, 0), "valor_financiado")
             prazo_financiamento = col4.number_input("Prazo financiamento (meses)", min_value=1, value=PRAZO_FINANCIAMENTO_PADRAO, step=1)
+
             col1, col2 = st.columns(2)
             taxa_financiamento = col1.number_input("Taxa financiamento mensal (%)", min_value=0.0, value=TAXA_FINANCIAMENTO_PADRAO, step=0.1)
             parcela_preview = calcular_parcela_price(valor_financiado, taxa_financiamento, prazo_financiamento)
             col2.metric("Parcela estimada", moeda(parcela_preview))
+
             st.info(f"Custo financeiro total estimado: {moeda(parcela_preview * prazo_financiamento - valor_financiado)}")
 
         st.markdown('<div class="section-title">Venda posterior</div>', unsafe_allow_html=True)
