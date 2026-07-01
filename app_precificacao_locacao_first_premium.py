@@ -30,6 +30,8 @@ CREDITO_REFORMA_PADRAO = 100.00
 COMISSAO_VENDEDOR_PADRAO = 5.00
 COMISSAO_GERENTE_PADRAO = 0.50
 VIDA_UTIL_PADRAO = 10.0
+TAXA_FINANCIAMENTO_PADRAO = 1.60
+PRAZO_FINANCIAMENTO_PADRAO = 36
 
 # ======================================================
 # BANCO DE DADOS
@@ -433,12 +435,47 @@ def calcular_payback(saida, fluxo_mensal):
         return 999
     return saida / fluxo_mensal
 
+
+def calcular_parcela_price(valor, taxa_mensal_pct, prazo_meses):
+    if valor <= 0 or prazo_meses <= 0:
+        return 0.0
+    i = taxa_mensal_pct / 100
+    if i == 0:
+        return valor / prazo_meses
+    return valor * (i * (1 + i) ** prazo_meses) / ((1 + i) ** prazo_meses - 1)
+
+def gerar_fluxo_financiamento(valor, taxa_mensal_pct, prazo_meses):
+    parcela = calcular_parcela_price(valor, taxa_mensal_pct, prazo_meses)
+    saldo = valor
+    linhas = []
+    i = taxa_mensal_pct / 100
+    for mes in range(1, int(prazo_meses) + 1):
+        juros = saldo * i
+        amortizacao = parcela - juros
+        saldo = max(saldo - amortizacao, 0)
+        linhas.append({
+            "Mês": mes,
+            "Parcela financiamento": parcela,
+            "Juros": juros,
+            "Amortização": amortizacao,
+            "Saldo financiamento": saldo
+        })
+    return pd.DataFrame(linhas)
+
+
 def calcular_operacao(p, interno=False):
     receita_locacao = p["aluguel_mensal"] * p["prazo"]
     despesas_total = (
         p["frete"] + p["instalacao"] + p["treinamento"] + p["adequacoes"]
         + p["seguro"] + p["manutencao"] + p["assistencia"] + p["outros_custos"]
     )
+
+    usar_financiamento = p.get("usar_financiamento", False)
+    valor_financiado = p.get("valor_financiado", 0.0) if usar_financiamento else 0.0
+    taxa_financiamento = p.get("taxa_financiamento", TAXA_FINANCIAMENTO_PADRAO)
+    prazo_financiamento = int(p.get("prazo_financiamento", PRAZO_FINANCIAMENTO_PADRAO))
+    parcela_financiamento = calcular_parcela_price(valor_financiado, taxa_financiamento, prazo_financiamento) if usar_financiamento else 0.0
+    custo_total_financiamento = (parcela_financiamento * prazo_financiamento - valor_financiado) if usar_financiamento else 0.0
 
     valor_contabil_final, valor_venda_estimado, percentual_depreciado = estimar_venda(
         p["valor_aquisicao"], p["prazo"], p["vida_util_anos"], p["fator_mercado"]
@@ -455,7 +492,10 @@ def calcular_operacao(p, interno=False):
     comissao_total = comissao_vendedor + comissao_gerente
 
     impostos_locacao = receita_locacao * p["imposto_locacao"] / 100
-    custo_financeiro = p["valor_aquisicao"] * (p["custo_financeiro_mensal"] / 100) * p["prazo"]
+    if usar_financiamento:
+        custo_financeiro = custo_total_financiamento
+    else:
+        custo_financeiro = p["valor_aquisicao"] * (p["custo_financeiro_mensal"] / 100) * p["prazo"]
 
     aliquota_reforma = p["cbs_reforma"] + p["ibs_reforma"]
     base_credito_reforma = p["valor_aquisicao"] + despesas_total
@@ -591,6 +631,12 @@ def calcular_operacao(p, interno=False):
         "comissao_total": comissao_total,
         "impostos_locacao": impostos_locacao,
         "custo_financeiro": custo_financeiro,
+        "usar_financiamento": usar_financiamento,
+        "valor_financiado": valor_financiado,
+        "taxa_financiamento": taxa_financiamento,
+        "prazo_financiamento": prazo_financiamento,
+        "parcela_financiamento": parcela_financiamento,
+        "custo_total_financiamento": custo_total_financiamento,
         "lucro_locacao": lucro_locacao,
         "margem_locacao": margem_locacao,
         "payback_locacao": payback_locacao,
@@ -635,6 +681,10 @@ def exportar_excel(p, resumo, fluxo_df, estrategia_df):
         ["Comissão gerente", resumo["comissao_gerente"]],
         ["Impostos locação", resumo["impostos_locacao"]],
         ["Custo financeiro", resumo["custo_financeiro"]],
+        ["Financiamento utilizado", "Sim" if resumo["usar_financiamento"] else "Não"],
+        ["Valor financiado", resumo["valor_financiado"]],
+        ["Parcela financiamento", resumo["parcela_financiamento"]],
+        ["Prazo financiamento", resumo["prazo_financiamento"]],
         ["Lucro somente locação", resumo["lucro_locacao"]],
         ["Margem somente locação", resumo["margem_locacao"]],
         ["Payback somente locação", resumo["payback_locacao"]],
@@ -794,6 +844,12 @@ elif menu == "1 - Cadastro da Operação":
             c3.metric("Fonte valor", ativo_selecionado.get('fonte_valor', ''))
             c4.metric("Depreciação atual", perc(dep_atual))
             c5.metric("Valor contábil atual", moeda(vl_contabil_atual))
+            st.caption("Os campos encontrados no relatório serão preenchidos automaticamente no cadastro. Você pode ajustar manualmente antes de calcular.")
+
+    ativo_key = "manual"
+    if ativo_selecionado:
+        ativo_key = str(ativo_selecionado.get('cod_bem') or ativo_selecionado.get('patrimonio') or ativo_selecionado.get('descricao') or 'ativo')
+        ativo_key = re.sub(r'[^0-9A-Za-z_]+', '_', ativo_key)[:40]
 
     with st.form("form_operacao"):
         st.markdown('<div class="section-title">Dados comerciais</div>', unsafe_allow_html=True)
@@ -803,24 +859,39 @@ elif menu == "1 - Cadastro da Operação":
         gerente = col3.text_input("Gerente")
 
         col1, col2, col3 = st.columns(3)
-        equipamento = col1.text_input("Equipamento", value=(ativo_selecionado.get("descricao", "") if ativo_selecionado else ""))
-        fabricante = col2.text_input("Fabricante / linha", value=(ativo_selecionado.get("marca", "") if ativo_selecionado else ""))
-        data_sim = col3.date_input("Data", value=date.today())
+        equipamento = col1.text_input(
+            "Equipamento",
+            value=(ativo_selecionado.get("descricao", "") if ativo_selecionado else ""),
+            key=f"equipamento_{ativo_key}"
+        )
+        fabricante = col2.text_input(
+            "Fabricante / linha",
+            value=(ativo_selecionado.get("marca", "") if ativo_selecionado else ""),
+            key=f"fabricante_{ativo_key}"
+        )
+        data_sim = col3.date_input("Data", value=date.today(), key=f"data_sim_{ativo_key}")
+
+        col1, col2, col3, col4 = st.columns(4)
+        cod_bem_form = col1.text_input("Código do bem", value=(ativo_selecionado.get("cod_bem", "") if ativo_selecionado else ""), key=f"cod_bem_{ativo_key}")
+        patrimonio_form = col2.text_input("Patrimônio", value=(ativo_selecionado.get("patrimonio", "") if ativo_selecionado else ""), key=f"patrimonio_{ativo_key}")
+        serie_form = col3.text_input("Nº série", value=(ativo_selecionado.get("num_serie", "") if ativo_selecionado else ""), key=f"serie_{ativo_key}")
+        cod_produto_form = col4.text_input("Código produto", value=(ativo_selecionado.get("cod_produto", "") if ativo_selecionado else ""), key=f"cod_produto_{ativo_key}")
 
         st.markdown('<div class="section-title">Contrato e ativo</div>', unsafe_allow_html=True)
         col1, col2, col3 = st.columns(3)
         with col1:
-            valor_aquisicao = input_moeda("Valor de aquisição", float(ativo_selecionado.get("valor_aquisicao", 400000.0)) if ativo_selecionado else 400000.0, "valor_aquisicao")
+            valor_aquisicao = input_moeda("Valor de aquisição", float(ativo_selecionado.get("valor_aquisicao", 400000.0)) if ativo_selecionado else 400000.0, f"valor_aquisicao_{ativo_key}")
         with col2:
             prazo = st.number_input("Prazo da locação (meses)", min_value=1, value=24, step=1)
         with col3:
             aluguel_mensal = input_moeda("Aluguel mensal", 18000.0, "aluguel_mensal")
 
         col1, col2, col3 = st.columns(3)
-        data_aquisicao_ativo = col1.date_input("Data de aquisição", value=(pd.to_datetime(ativo_selecionado.get("data_aquisicao")).date() if ativo_selecionado and not pd.isna(ativo_selecionado.get("data_aquisicao")) else date.today()))
+        data_aquisicao_padrao = (pd.to_datetime(ativo_selecionado.get("data_aquisicao")).date() if ativo_selecionado and not pd.isna(ativo_selecionado.get("data_aquisicao")) else date.today())
+        data_aquisicao_ativo = col1.date_input("Data de aquisição", value=data_aquisicao_padrao, key=f"data_aquisicao_{ativo_key}")
         vida_util_anos = col2.number_input("Vida útil para depreciação (anos)", min_value=1.0, value=VIDA_UTIL_PADRAO, step=0.5)
-        custo_financeiro_mensal = col3.number_input("Custo financeiro mensal (%)", min_value=0.0, value=1.2, step=0.1)
-        margem_desejada = st.number_input("Margem líquida desejada (%)", min_value=0.0, value=20.0, step=1.0)
+        custo_financeiro_mensal = col3.number_input("Custo financeiro mensal (%)", min_value=0.0, value=1.6, step=0.1)
+        margem_desejada = st.number_input("Margem líquida desejada (%)", min_value=0.0, value=25.0, step=1.0)
 
         st.markdown('<div class="section-title">Venda posterior</div>', unsafe_allow_html=True)
         col1, col2, col3 = st.columns(3)
@@ -875,9 +946,11 @@ elif menu == "1 - Cadastro da Operação":
             gerente=gerente,
             equipamento=equipamento or "Equipamento não informado",
             fabricante=fabricante,
-            data_sim=str(data_sim),
-            cod_bem=(ativo_selecionado.get("cod_bem", "") if ativo_selecionado else ""),
-            patrimonio=(ativo_selecionado.get("patrimonio", "") if ativo_selecionado else ""),
+            data_sim=data_sim.strftime("%d/%m/%Y"),
+            cod_bem=cod_bem_form,
+            patrimonio=patrimonio_form,
+            num_serie=serie_form,
+            cod_produto=cod_produto_form,
             data_aquisicao=str(data_aquisicao_ativo),
             valor_aquisicao=valor_aquisicao,
             prazo=int(prazo),
@@ -885,6 +958,10 @@ elif menu == "1 - Cadastro da Operação":
             vida_util_anos=vida_util_anos,
             custo_financeiro_mensal=custo_financeiro_mensal,
             margem_desejada=margem_desejada,
+            usar_financiamento=usar_financiamento,
+            valor_financiado=valor_financiado,
+            taxa_financiamento=taxa_financiamento,
+            prazo_financiamento=int(prazo_financiamento),
             fator_mercado=fator_mercado,
             usar_venda_manual=usar_venda_manual,
             valor_venda_manual=valor_venda_manual,
@@ -1052,12 +1129,12 @@ elif menu == "2 - Precificação Reversa":
     with col2:
         prazo = st.number_input("Prazo (meses)", value=24, step=1)
     with col3:
-        margem = st.number_input("Margem desejada (%)", value=20.0, step=1.0)
+        margem = st.number_input("Margem desejada (%)", value=25.0, step=1.0)
 
     col1, col2, col3 = st.columns(3)
     vida = col1.number_input("Vida útil (anos)", value=VIDA_UTIL_PADRAO, step=0.5)
     fator = col2.number_input("Fator de mercado (%)", value=100.0, step=5.0)
-    custo_fin_mensal = col3.number_input("Custo financeiro mensal (%)", value=1.2, step=0.1)
+    custo_fin_mensal = col3.number_input("Custo financeiro mensal (%)", value=1.6, step=0.1)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -1119,6 +1196,9 @@ elif menu == "3 - Parâmetros":
         ["Regime", "Lucro Presumido"],
         ["ISS", "Não considerado"],
         ["Vida útil padrão", "10 anos"],
+        ["Custo financeiro padrão", "1,60% ao mês"],
+        ["Margem desejada padrão", "25,00%"],
+        ["Financiamento bancário", "Tabela Price, taxa e prazo editáveis"],
         ["Impostos sobre locação", "14,30%"],
         ["Tributação da venda do ativo", "Ganho de capital"],
         ["Ganho de capital", "34,00%"],
