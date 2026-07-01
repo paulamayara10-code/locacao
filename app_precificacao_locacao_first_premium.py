@@ -157,61 +157,125 @@ def formatar_df(df, money_cols=None, percent_cols=None, month_cols=None):
 
 
 # ======================================================
-# BASE DE ATIVOS / ATFR010
+# BASE DE ATIVOS / ATFR210
 # ======================================================
 def normalizar_base_ativos(arquivo):
+    """Carrega ATFR210/ATFR010 ou CSV normalizado.
+
+    Regra de valor:
+    1) Usa sempre Vl Aquisicao quando houver valor maior que zero.
+    2) Quando não houver Vl Aquisicao, usa o maior valor entre Val Orig M1...M5.
+    """
     try:
         if str(arquivo).lower().endswith('.csv'):
-            df = pd.read_csv(arquivo)
-            return df
+            df_csv = pd.read_csv(arquivo)
+            return limpar_base_ativos(df_csv)
     except Exception:
         pass
 
-    df_raw = pd.read_excel(arquivo, sheet_name=0, header=1)
+    # ATFR210 normalmente vem na aba 2, com cabeçalho na linha 2.
+    try:
+        xls = pd.ExcelFile(arquivo)
+        sheet = None
+        for s in xls.sheet_names:
+            if 'Bens Saldos - por Codigo' in s or 'Bens/Saldos - por Codigo' in s:
+                sheet = s
+                break
+        if sheet is None:
+            sheet = xls.sheet_names[0]
+        df_raw = pd.read_excel(arquivo, sheet_name=sheet, header=1)
+    except Exception:
+        df_raw = pd.read_excel(arquivo, sheet_name=0, header=1)
+
+    # Normaliza nomes possíveis do ATFR010 e ATFR210.
     colmap = {
+        'Cod Base Bem': 'cod_bem',
         'Cod. do Bem': 'cod_bem',
+        'Codigo Item': 'item',
         'Item': 'item',
-        'Dt.Aquisicao': 'data_aquisicao',
-        'Descr. Sint.': 'descricao',
+        'Tipo Ativo': 'tipo_ativo',
         'Patrimonio': 'patrimonio',
+        'Descr. Sint.': 'descricao',
+        'Grupo': 'grupo',
+        'Quantidade': 'quantidade',
+        'Dt.Aquisicao': 'data_aquisicao',
         'Num de Serie': 'num_serie',
-        'Status Bem': 'status',
-        'Vl Aquisicao': 'valor_aquisicao',
-        'Cod. Produto': 'cod_produto',
         'Marca': 'marca',
+        'Status Bem': 'status',
+        'Vl Aquisicao': 'vl_aquisicao_original',
+        'Ativo Propr': 'ativo_proprio',
+        'Val Orig M1': 'val_orig_m1',
+        'Val Orig M2': 'val_orig_m2',
+        'Val Orig M3': 'val_orig_m3',
+        'Val Orig M4': 'val_orig_m4',
+        'Val Orig M5': 'val_orig_m5',
+        'Cod. Produto': 'cod_produto',
         'Serie': 'serie',
         'Dt Calibr': 'dt_calibracao',
         'Dt Venciment': 'dt_vencimento',
     }
     cols = [c for c in colmap if c in df_raw.columns]
     df = df_raw[cols].rename(columns=colmap).copy()
+
+    # Regra do valor de aquisição: Vl Aquisicao > 0, senão maior Val Orig M1..M5.
+    if 'vl_aquisicao_original' not in df.columns:
+        df['vl_aquisicao_original'] = 0.0
+    df['vl_aquisicao_original'] = pd.to_numeric(df['vl_aquisicao_original'], errors='coerce').fillna(0.0)
+
+    valor_cols = ['val_orig_m1','val_orig_m2','val_orig_m3','val_orig_m4','val_orig_m5']
+    for c in valor_cols:
+        if c not in df.columns:
+            df[c] = 0.0
+        df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
+    maior_valor = df[valor_cols].max(axis=1)
+    df['valor_aquisicao'] = np.where(df['vl_aquisicao_original'] > 0, df['vl_aquisicao_original'], maior_valor)
+    df['fonte_valor'] = np.where(df['vl_aquisicao_original'] > 0, 'Vl Aquisicao', 'Maior entre Val Orig M1-M5')
+
     return limpar_base_ativos(df)
 
 def limpar_base_ativos(df):
     df = df.copy()
-    for c in ['cod_bem','item','descricao','patrimonio','num_serie','status','cod_produto','marca','serie']:
+    for c in ['cod_bem','item','descricao','patrimonio','num_serie','status','cod_produto','marca','serie','grupo','fonte_valor','ativo_proprio']:
         if c not in df.columns:
             df[c] = ''
         df[c] = df[c].fillna('').astype(str).str.strip()
+
     if 'valor_aquisicao' not in df.columns:
         df['valor_aquisicao'] = 0.0
     df['valor_aquisicao'] = pd.to_numeric(df['valor_aquisicao'], errors='coerce').fillna(0.0)
+
+    for c in ['vl_aquisicao_original','val_orig_m1','val_orig_m2','val_orig_m3','val_orig_m4','val_orig_m5']:
+        if c not in df.columns:
+            df[c] = 0.0
+        df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
+
     for c in ['data_aquisicao','dt_calibracao','dt_vencimento']:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors='coerce')
         else:
             df[c] = pd.NaT
+
     df = df[(df['cod_bem'] != '') | (df['descricao'] != '')]
-    df['label'] = df.apply(lambda r: f"{r.get('cod_bem','')} | {r.get('patrimonio','')} | {r.get('descricao','')} | {moeda(r.get('valor_aquisicao',0))}", axis=1)
+    df['label'] = df.apply(
+        lambda r: f"{r.get('cod_bem','')} | {r.get('patrimonio','')} | {r.get('descricao','')} | {moeda(r.get('valor_aquisicao',0))}",
+        axis=1
+    )
     return df.reset_index(drop=True)
 
 def carregar_ativos_padrao():
-    caminhos = ['ativos_pre_cadastro.csv', '/mnt/data/ativos_pre_cadastro.csv', 'atfr010.xlsx', 'atfr010(1).xlsx']
+    caminhos = [
+        'ativos_pre_cadastro.csv',
+        '/mnt/data/ativos_pre_cadastro.csv',
+        'ativos_pre_cadastro_atfr210.csv',
+        '/mnt/data/ativos_pre_cadastro_atfr210.csv',
+        'atfr210.xlsx',
+        '/mnt/data/atfr210.xlsx',
+        'atfr010.xlsx',
+        'atfr010(1).xlsx'
+    ]
     for caminho in caminhos:
         if os.path.exists(caminho):
             try:
-                if caminho.lower().endswith('.csv'):
-                    return limpar_base_ativos(pd.read_csv(caminho))
                 return normalizar_base_ativos(caminho)
             except Exception:
                 pass
@@ -623,7 +687,7 @@ if "ativos_df" not in st.session_state:
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Base de ativos")
-upload_ativos = st.sidebar.file_uploader("Importar ATFR010 / ativos", type=["xlsx", "csv"])
+upload_ativos = st.sidebar.file_uploader("Importar ATFR210 / ativos", type=["xlsx", "csv"])
 if upload_ativos is not None:
     try:
         st.session_state.ativos_df = normalizar_base_ativos(upload_ativos)
@@ -724,11 +788,12 @@ elif menu == "1 - Cadastro da Operação":
             idx = ativos_filtrados[ativos_filtrados['label'] == escolha_ativo].index[0]
             ativo_selecionado = ativos_filtrados.loc[idx].to_dict()
             meses_uso, dep_atual, vl_contabil_atual = calcular_depreciacao_atual_ativo(ativo_selecionado.get('valor_aquisicao', 0), ativo_selecionado.get('data_aquisicao'), VIDA_UTIL_PADRAO)
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Código", ativo_selecionado.get('cod_bem', ''))
             c2.metric("Aquisição", moeda(ativo_selecionado.get('valor_aquisicao', 0)))
-            c3.metric("Depreciação atual", perc(dep_atual))
-            c4.metric("Valor contábil atual", moeda(vl_contabil_atual))
+            c3.metric("Fonte valor", ativo_selecionado.get('fonte_valor', ''))
+            c4.metric("Depreciação atual", perc(dep_atual))
+            c5.metric("Valor contábil atual", moeda(vl_contabil_atual))
 
     with st.form("form_operacao"):
         st.markdown('<div class="section-title">Dados comerciais</div>', unsafe_allow_html=True)
@@ -1129,7 +1194,7 @@ elif menu == "5 - Ativos":
 
     ativos_df = st.session_state.get("ativos_df", pd.DataFrame())
     if ativos_df.empty:
-        st.info("Importe a base ATFR010 no menu lateral para consultar os ativos.")
+        st.info("Importe a base ATFR210 no menu lateral para consultar os ativos.")
     else:
         termo = st.text_input("Buscar", "")
         view = ativos_df.copy()
