@@ -156,6 +156,46 @@ def get_col(row, names, default=""):
             return row[n]
     return default
 
+def numero_base(valor):
+    """Converte valores da base sem alterar casas decimais.
+
+    Exemplos:
+    - 8931.44 (float) -> 8931.44
+    - "8.931,44" -> 8931.44
+    - "8931.44" -> 8931.44
+    """
+    if valor is None:
+        return 0.0
+
+    if isinstance(valor, (int, float, np.integer, np.floating)):
+        try:
+            if pd.isna(valor):
+                return 0.0
+        except Exception:
+            pass
+        return float(valor)
+
+    texto = str(valor).strip()
+    if texto == "" or texto.lower() in {"nan", "none", "-", "--"}:
+        return 0.0
+
+    texto = texto.replace("R$", "").replace(" ", "")
+
+    if "," in texto and "." in texto:
+        # Formato brasileiro: 8.931,44
+        texto = texto.replace(".", "").replace(",", ".")
+    elif "," in texto:
+        # Formato brasileiro sem milhar: 8931,44
+        texto = texto.replace(",", ".")
+    # Se houver apenas ponto, presume formato numérico internacional: 8931.44
+
+    texto = re.sub(r"[^0-9.\-]", "", texto)
+
+    try:
+        return float(texto)
+    except Exception:
+        return 0.0
+
 # ======================================================
 # ATIVOS
 # ======================================================
@@ -186,19 +226,13 @@ def montar_label_ativo(row):
     desc = str(get_col(row, ["Descricao", "Descrição", "Desc Bem", "descricao", "Produto", "produto"], "")).strip()
     serie = str(get_col(row, ["Serie", "Série", "Num Serie", "N Serie", "serie"], "")).strip()
     valor = get_col(row, ["Valor_Aquisicao", "Valor Aquisição", "Vl Aquisicao", "Vl_Aquisicao", "valor_aquisicao"], 0)
-    try:
-        valor_f = float(str(valor).replace(".", "").replace(",", "."))
-    except Exception:
-        valor_f = 0
+    valor_f = numero_base(valor)
     base = " | ".join([x for x in [cod, desc[:60], serie] if x])
     return f"{base} | {moeda(valor_f)}" if base else f"Ativo {moeda(valor_f)}"
 
 def extrair_ativo(row):
     valor = get_col(row, ["Valor_Aquisicao", "Valor Aquisição", "Vl Aquisicao", "Vl_Aquisicao", "valor_aquisicao"], 0)
-    try:
-        valor = float(str(valor).replace(".", "").replace(",", "."))
-    except Exception:
-        valor = 0.0
+    valor = numero_base(valor)
     return {
         "equipamento": str(get_col(row, ["Descricao", "Descrição", "Desc Bem", "descricao", "Produto", "produto"], "")),
         "fabricante": str(get_col(row, ["Marca", "Fabricante", "marca", "fabricante"], "")),
