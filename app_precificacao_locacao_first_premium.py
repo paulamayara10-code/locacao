@@ -221,6 +221,26 @@ def normalizar_data_br(valor):
         return str(valor)
     return dt.strftime("%d/%m/%Y")
 
+def converter_data(valor, padrao=None):
+    """Converte datas do cadastro ou do formulário para Timestamp."""
+    if valor is None or str(valor).strip() == "":
+        return pd.Timestamp(padrao if padrao is not None else date.today())
+    dt = pd.to_datetime(valor, errors="coerce", dayfirst=True)
+    if pd.isna(dt):
+        return pd.Timestamp(padrao if padrao is not None else date.today())
+    return pd.Timestamp(dt)
+
+def meses_entre(data_inicial, data_final):
+    """Meses completos aproximados entre duas datas, sem valores negativos."""
+    inicio = converter_data(data_inicial)
+    fim = converter_data(data_final)
+    if fim <= inicio:
+        return 0
+    meses = (fim.year - inicio.year) * 12 + (fim.month - inicio.month)
+    if fim.day < inicio.day:
+        meses -= 1
+    return max(int(meses), 0)
+
 def montar_label_ativo(row):
     cod = str(get_col(row, ["Codigo", "Código", "Cod Bem", "Cod_Bem", "codigo", "cod_bem"], "")).strip()
     desc = str(get_col(row, ["Descricao", "Descrição", "Desc Bem", "descricao", "Produto", "produto"], "")).strip()
@@ -279,13 +299,19 @@ def calcular_parcela_price(valor, taxa_mensal_pct, prazo_meses):
         return valor / prazo_meses
     return valor * (i * (1 + i) ** prazo_meses) / ((1 + i) ** prazo_meses - 1)
 
-def estimar_venda(valor_aquisicao, prazo, vida_util_anos, fator_mercado):
-    vida_meses = vida_util_anos * 12
-    percentual_depreciado = min(prazo / vida_meses, 1) * 100
+def estimar_venda(valor_aquisicao, prazo, vida_util_anos, fator_mercado, data_aquisicao, data_inicio_locacao):
+    vida_meses = max(int(round(vida_util_anos * 12)), 1)
+
+    meses_anteriores = meses_entre(data_aquisicao, data_inicio_locacao)
+    meses_totais_depreciados = min(meses_anteriores + int(prazo), vida_meses)
+
+    percentual_depreciado = min(meses_totais_depreciados / vida_meses, 1) * 100
     valor_contabil = max(valor_aquisicao * (1 - percentual_depreciado / 100), 0)
+
     valor_base = valor_contabil if percentual_depreciado < 100 else valor_aquisicao * 0.10
     valor_venda = valor_base * (fator_mercado / 100)
-    return valor_contabil, valor_venda, percentual_depreciado
+
+    return valor_contabil, valor_venda, percentual_depreciado, meses_anteriores, meses_totais_depreciados
 
 def classificar(margem, lucro, payback, prazo):
     if lucro < 0 or margem < 8:
@@ -313,8 +339,13 @@ def calcular_operacao(p, interno=False):
         p["seguro"] + p["manutencao"] + p["assistencia"] + p["outros_custos"]
     )
 
-    valor_contabil_final, valor_venda_estimado, percentual_depreciado = estimar_venda(
-        p["valor_aquisicao"], p["prazo"], p["vida_util_anos"], p["fator_mercado"]
+    valor_contabil_final, valor_venda_estimado, percentual_depreciado, meses_depreciados_antes, meses_depreciados_total = estimar_venda(
+        p["valor_aquisicao"],
+        p["prazo"],
+        p["vida_util_anos"],
+        p["fator_mercado"],
+        p["data_aquisicao"],
+        p["data_inicio_locacao"]
     )
     if p["usar_venda_manual"]:
         valor_venda_estimado = p["valor_venda_manual"]
@@ -397,7 +428,9 @@ def calcular_operacao(p, interno=False):
         f"Somente locação: {status_locacao.lower()}, margem {perc(margem_locacao)} e payback {meses(payback_locacao)}. "
         f"Locação com venda posterior: {status_venda.lower()}, margem {perc(margem_locacao_venda)} e payback {meses(payback_venda)}. "
         f"A origem do investimento é {p['origem_investimento'].lower()}. "
-        f"Ao final, o ativo estará {perc(percentual_depreciado)} depreciado, com valor contábil de {moeda(valor_contabil_final)}. "
+        f"O ativo já possuía {meses_depreciados_antes} mês(es) de depreciação antes do início deste contrato. "
+        f"Ao final, terá {meses_depreciados_total} mês(es) depreciados, equivalente a {perc(percentual_depreciado)}, "
+        f"com valor contábil de {moeda(valor_contabil_final)}. "
         f"Venda estimada: {moeda(valor_venda_estimado)}; ganho de capital: {moeda(ganho_capital)}."
     )
 
@@ -407,6 +440,8 @@ def calcular_operacao(p, interno=False):
         "valor_contabil_final": valor_contabil_final,
         "valor_venda_estimado": valor_venda_estimado,
         "percentual_depreciado": percentual_depreciado,
+        "meses_depreciados_antes": meses_depreciados_antes,
+        "meses_depreciados_total": meses_depreciados_total,
         "ganho_capital": ganho_capital,
         "impostos_ganho_capital": impostos_ganho_capital,
         "comissao_vendedor": comissao_vendedor,
@@ -453,6 +488,10 @@ def exportar_excel(p, resumo, fluxo_df, estrategia_df):
     output = BytesIO()
     memorial = pd.DataFrame([
         ["Origem investimento", p["origem_investimento"]],
+        ["Data de aquisição", p["data_aquisicao"]],
+        ["Início da locação", p["data_inicio_locacao"]],
+        ["Meses depreciados antes do contrato", resumo["meses_depreciados_antes"]],
+        ["Meses depreciados ao final", resumo["meses_depreciados_total"]],
         ["Receita locação", resumo["receita_locacao"]],
         ["Valor aquisição", p["valor_aquisicao"]],
         ["Despesas previstas", resumo["despesas_total"]],
@@ -547,10 +586,28 @@ elif menu == "1 - Cadastro da Operação":
         vendedor = col2.text_input("Vendedor")
         gerente = col3.text_input("Gerente")
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         equipamento = col1.text_input("Equipamento", value=ativo_info.get("equipamento",""))
         fabricante = col2.text_input("Fabricante / linha", value=ativo_info.get("fabricante",""))
-        data_sim = col3.date_input("Data", value=date.today(), format="DD/MM/YYYY")
+
+        data_aquisicao_padrao = converter_data(ativo_info.get("data_aquisicao", ""), date.today()).date()
+
+        col1, col2, col3 = st.columns(3)
+        data_aquisicao = col1.date_input(
+            "Data de aquisição",
+            value=data_aquisicao_padrao,
+            format="DD/MM/YYYY"
+        )
+        data_inicio_locacao = col2.date_input(
+            "Início da locação",
+            value=date.today(),
+            format="DD/MM/YYYY"
+        )
+        data_sim = col3.date_input(
+            "Data da simulação",
+            value=date.today(),
+            format="DD/MM/YYYY"
+        )
 
         st.markdown('<div class="section-title">Contrato e ativo</div>', unsafe_allow_html=True)
         col1, col2, col3 = st.columns(3)
@@ -642,6 +699,8 @@ elif menu == "1 - Cadastro da Operação":
             equipamento=equipamento or "Equipamento não informado",
             fabricante=fabricante,
             data_sim=data_sim.strftime("%d/%m/%Y"),
+            data_aquisicao=data_aquisicao.strftime("%d/%m/%Y"),
+            data_inicio_locacao=data_inicio_locacao.strftime("%d/%m/%Y"),
             valor_aquisicao=valor_aquisicao,
             prazo=int(prazo),
             aluguel_mensal=aluguel_mensal,
@@ -691,10 +750,19 @@ elif menu == "1 - Cadastro da Operação":
         for col,(label,value,help_text) in zip(cols,cards):
             with col: st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div><div class="metric-help">{help_text}</div></div>', unsafe_allow_html=True)
 
-        cards = [("Depreciação", perc(resumo["percentual_depreciado"]), "Ao final do prazo"),("Valor contábil", moeda(resumo["valor_contabil_final"]), "Valor líquido contábil"),("Ganho de capital", moeda(resumo["ganho_capital"]), "Venda - valor contábil"),("Imposto ganho capital", moeda(resumo["impostos_ganho_capital"]), "34% padrão")]
+        cards = [
+            ("Meses já depreciados", f'{resumo["meses_depreciados_antes"]} meses', "Antes deste contrato"),
+            ("Depreciação final", perc(resumo["percentual_depreciado"]), f'{resumo["meses_depreciados_total"]} meses no total'),
+            ("Valor contábil", moeda(resumo["valor_contabil_final"]), "Ao final da locação"),
+            ("Ganho de capital", moeda(resumo["ganho_capital"]), "Venda - valor contábil")
+        ]
         cols = st.columns(4)
         for col,(label,value,help_text) in zip(cols,cards):
             with col: st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div><div class="metric-help">{help_text}</div></div>', unsafe_allow_html=True)
+
+        st.markdown(
+            f"**Imposto estimado sobre ganho de capital:** {moeda(resumo['impostos_ganho_capital'])}"
+        )
 
         if origem_investimento == "Financiamento bancário":
             st.markdown('<div class="section-title">Financiamento bancário</div>', unsafe_allow_html=True)
@@ -764,7 +832,9 @@ elif menu == "2 - Precificação Reversa":
     prazo_fin = col2.number_input("Prazo financiamento", value=PRAZO_FINANCIAMENTO_PADRAO, step=1, disabled=(origem=="Capital próprio"))
 
     if st.button("Calcular aluguel mínimo", use_container_width=True):
-        valor_contabil, venda_estimada, _ = estimar_venda(valor, prazo, vida, fator)
+        valor_contabil, venda_estimada, _, _, _ = estimar_venda(
+            valor, prazo, vida, fator, date.today(), date.today()
+        )
         if tipo == "Somente locação":
             venda_estimada = 0
         ganho = max(venda_estimada - valor_contabil, 0)
