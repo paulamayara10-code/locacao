@@ -1,211 +1,1651 @@
-import json, re, sqlite3
+
+import json
+import re
+import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title='First Medical | Precificação', page_icon='💼', layout='wide')
-DB='historico_precificacao.db'; ATIVOS='ativos_pre_cadastro.csv'
-IMP=14.30; NAC=65.0; CV=5.0; CG=0.5; CR=14.0; MARGEM=25.0; TAXA_FIN=1.60; PRAZO_FIN=36
+# ======================================================
+# CONFIGURAÇÃO
+# ======================================================
+st.set_page_config(
+    page_title="First Medical | Precificação de Locação",
+    page_icon="💼",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-st.markdown('''<style>
+DB_PATH = "historico_precificacao.db"
+ATIVOS_CSV = "ativos_pre_cadastro.csv"
+
+IMPOSTO_ATUAL = 14.30
+NACIONALIZACAO_PADRAO = 65.00
+COMISSAO_VENDEDOR = 5.00
+COMISSAO_GERENTE = 0.50
+COMISSAO_REPRESENTANTE = 14.00
+MARGEM_PADRAO = 25.00
+TAXA_FINANCIAMENTO = 1.60
+PRAZO_FINANCIAMENTO = 36
+VIDA_UTIL_PADRAO = 10.0
+
+# Premissas gerenciais pós-reforma — sempre editáveis
+CBS_PADRAO = 8.80
+IBS_PADRAO = 17.70
+CREDITO_PADRAO = 100.00
+
+# ======================================================
+# ESTILO
+# ======================================================
+st.markdown(
+    """
+<style>
 .stApp{background:linear-gradient(180deg,#F5F8FC 0%,#EEF3F8 100%)}
+.block-container{padding-top:1.1rem;padding-bottom:2.5rem}
 section[data-testid="stSidebar"]{background:linear-gradient(180deg,#071F33 0%,#0B2F4A 100%)}
 section[data-testid="stSidebar"] *{color:white!important}
-.hero{background:linear-gradient(135deg,#0B2F4A 0%,#155E75 70%,#1B7893 100%);border-radius:24px;padding:28px 32px;color:white;margin-bottom:20px}
-.hero h1{margin:0;font-size:2rem}.hero p{margin:8px 0 0;color:#e8f2f8}
-.metric-card{background:white;border-radius:18px;padding:18px 20px;box-shadow:0 8px 24px rgba(15,46,74,.07);min-height:112px;margin-bottom:12px}
-.metric-label{color:#64748B;font-size:.78rem;text-transform:uppercase;font-weight:800}.metric-value{color:#0B2F4A;font-size:1.35rem;font-weight:850;margin-top:8px}.metric-help{color:#64748B;font-size:.84rem;margin-top:6px}
+.hero{background:linear-gradient(135deg,#0B2F4A 0%,#155E75 70%,#1B7893 100%);border-radius:24px;padding:28px 32px;color:white;box-shadow:0 12px 32px rgba(15,46,74,.20);margin-bottom:20px}
+.hero h1{font-size:2rem;margin:0;font-weight:850;letter-spacing:-.03em}
+.hero p{margin:8px 0 0;color:rgba(255,255,255,.88)}
+.metric-card{background:white;border-radius:20px;padding:18px 20px;border:1px solid rgba(15,46,74,.08);box-shadow:0 8px 24px rgba(15,46,74,.07);min-height:120px;margin-bottom:14px}
+.metric-label{color:#64748B;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;font-weight:800}
+.metric-value{color:#0B2F4A;font-size:1.34rem;font-weight:850;margin-top:8px;letter-spacing:-.03em}
+.metric-help{color:#64748B;font-size:.84rem;margin-top:6px}
 .section-title{color:#0B2F4A;font-size:1.18rem;font-weight:850;margin:16px 0 10px}
-.stButton>button,.stDownloadButton>button{border-radius:14px!important;border:0!important;background:linear-gradient(135deg,#0B2F4A,#155E75)!important;color:white!important;font-weight:800!important}
-</style>''', unsafe_allow_html=True)
+.parecer{background:#fff;border-left:6px solid #D7A84F;padding:18px 20px;border-radius:16px;box-shadow:0 8px 24px rgba(15,46,74,.07);color:#0B2F4A;line-height:1.55;margin:12px 0 18px}
+.stButton>button,.stDownloadButton>button{border-radius:14px!important;border:0!important;background:linear-gradient(135deg,#0B2F4A,#155E75)!important;color:white!important;font-weight:800!important;padding:.75rem 1rem!important}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
+# ======================================================
+# BANCO DE DADOS
+# ======================================================
 def init_db():
-    c=sqlite3.connect(DB); c.execute('''CREATE TABLE IF NOT EXISTS historico(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,data_hora TEXT,tipo TEXT,cliente TEXT,equipamento TEXT,fabricante TEXT,responsavel TEXT,prazo INTEGER,investimento REAL,aluguel REAL,receita REAL,custos REAL,impostos REAL,comissao REAL,lucro REAL,margem REAL,aluguel_minimo REAL,origem TEXT,detalhes TEXT)'''); c.commit(); c.close()
-def salvar(d):
-    c=sqlite3.connect(DB); cols=', '.join(d); vals=', '.join(['?']*len(d)); c.execute(f'INSERT INTO historico({cols}) VALUES({vals})',list(d.values())); c.commit(); c.close()
-def hist():
-    c=sqlite3.connect(DB)
-    try: df=pd.read_sql_query('SELECT * FROM historico ORDER BY id DESC',c)
-    except: df=pd.DataFrame()
-    c.close(); return df
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS historico_v17(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data_hora TEXT,
+            tipo TEXT,
+            cliente TEXT,
+            equipamento TEXT,
+            fabricante TEXT,
+            responsavel TEXT,
+            prazo INTEGER,
+            investimento REAL,
+            aluguel REAL,
+            receita REAL,
+            custos REAL,
+            impostos REAL,
+            comissao REAL,
+            lucro REAL,
+            margem REAL,
+            payback REAL,
+            aluguel_minimo REAL,
+            depreciacao REAL,
+            valor_contabil REAL,
+            lucro_reforma REAL,
+            origem TEXT,
+            detalhes TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def salvar(registro):
+    conn = sqlite3.connect(DB_PATH)
+    cols = ", ".join(registro.keys())
+    marks = ", ".join(["?"] * len(registro))
+    conn.execute(
+        f"INSERT INTO historico_v17({cols}) VALUES({marks})",
+        list(registro.values()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def historico():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(
+            "SELECT * FROM historico_v17 ORDER BY id DESC",
+            conn,
+        )
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
+
 init_db()
 
+# ======================================================
+# FORMATAÇÃO
+# ======================================================
 def moeda(v):
-    try:return f'R$ {float(v):,.2f}'.replace(',','X').replace('.',',').replace('X','.')
-    except:return 'R$ 0,00'
+    try:
+        return (
+            f"R$ {float(v):,.2f}"
+            .replace(",", "X")
+            .replace(".", ",")
+            .replace("X", ".")
+        )
+    except Exception:
+        return "R$ 0,00"
+
+
 def perc(v):
-    try:return f'{float(v):.2f}%'.replace('.',',')
-    except:return '0,00%'
+    try:
+        return f"{float(v):.2f}%".replace(".", ",")
+    except Exception:
+        return "0,00%"
+
+
+def meses(v):
+    try:
+        if float(v) >= 900:
+            return "Não recupera"
+        return f"{float(v):.1f} meses".replace(".", ",")
+    except Exception:
+        return "N/A"
+
+
 def parse(v):
-    if isinstance(v,(int,float,np.integer,np.floating)): return float(v)
-    s=str(v or '').replace('R$','').replace(' ','')
-    if ',' in s and '.' in s:s=s.replace('.','').replace(',','.')
-    elif ',' in s:s=s.replace(',','.')
-    s=re.sub(r'[^0-9.\-]','',s)
-    try:return float(s)
-    except:return 0.0
-def input_rs(label,valor,key):
-    t=st.text_input(label,value=moeda(valor),key=key); v=parse(t); st.caption(f'Valor considerado: {moeda(v)}'); return v
-def card(l,v,h): st.markdown(f'<div class="metric-card"><div class="metric-label">{l}</div><div class="metric-value">{v}</div><div class="metric-help">{h}</div></div>',unsafe_allow_html=True)
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return float(v)
+    s = str(v or "").replace("R$", "").replace(" ", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    s = re.sub(r"[^0-9.\-]", "", s)
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
 
-def price(valor,taxa,prazo):
-    if valor<=0 or prazo<=0:return 0.0
-    i=taxa/100
-    return valor/prazo if i==0 else valor*(i*(1+i)**prazo)/((1+i)**prazo-1)
 
-def calc(invest,prazo,aluguel,custos,imp,com,margem,custo_fin=0):
-    rec=aluguel*prazo; impostos=rec*imp/100; comissao=rec*com/100; ct=invest+custos+custo_fin; lucro=rec-ct-impostos-comissao; mg=lucro/rec*100 if rec else 0
-    den=1-imp/100-com/100-margem/100; minimo=(ct/prazo)/den if den>0 and prazo>0 else 0
-    return dict(receita=rec,impostos=impostos,comissao=comissao,custos=ct,lucro=lucro,margem=mg,minimo=minimo)
+def input_rs(label, value, key):
+    texto = st.text_input(label, value=moeda(value), key=key)
+    val = parse(texto)
+    st.caption(f"Valor considerado: {moeda(val)}")
+    return val
 
-def com_pct(tipo,v,g,r): return v+g if tipo=='Vendedor + gerente' else r if tipo=='Representante' else 0.0
 
-@st.cache_data(ttl=3600,show_spinner=False)
+def card(label, value, help_text):
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">{label}</div>
+            <div class="metric-value">{value}</div>
+            <div class="metric-help">{help_text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def tabela_formatada(df, money=None, percent=None, months=None):
+    out = df.copy()
+    for c in money or []:
+        if c in out.columns:
+            out[c] = out[c].map(moeda)
+    for c in percent or []:
+        if c in out.columns:
+            out[c] = out[c].map(perc)
+    for c in months or []:
+        if c in out.columns:
+            out[c] = out[c].map(meses)
+    return out
+
+# ======================================================
+# CÁLCULOS GERAIS
+# ======================================================
+def price(valor, taxa, prazo):
+    if valor <= 0 or prazo <= 0:
+        return 0.0
+    i = taxa / 100
+    if i == 0:
+        return valor / prazo
+    return valor * (i * (1 + i) ** prazo) / ((1 + i) ** prazo - 1)
+
+
+def comissao_total(tipo, vendedor, gerente, representante):
+    if tipo == "Vendedor + gerente":
+        return vendedor + gerente
+    if tipo == "Representante":
+        return representante
+    return 0.0
+
+
+def calcular_depreciacao(valor, data_aquisicao, data_inicio, prazo, vida_anos):
+    data_aq = pd.to_datetime(data_aquisicao, errors="coerce", dayfirst=True)
+    data_ini = pd.to_datetime(data_inicio, errors="coerce", dayfirst=True)
+
+    if pd.isna(data_aq):
+        data_aq = pd.Timestamp(data_ini if not pd.isna(data_ini) else date.today())
+    if pd.isna(data_ini):
+        data_ini = pd.Timestamp(date.today())
+
+    meses_antes = max(
+        (data_ini.year - data_aq.year) * 12
+        + data_ini.month
+        - data_aq.month
+        - (1 if data_ini.day < data_aq.day else 0),
+        0,
+    )
+
+    vida_meses = max(int(vida_anos * 12), 1)
+    meses_finais = min(meses_antes + int(prazo), vida_meses)
+    taxa = meses_finais / vida_meses
+    depreciacao = valor * taxa
+    valor_contabil = max(valor - depreciacao, 0)
+
+    return {
+        "meses_antes": meses_antes,
+        "meses_finais": meses_finais,
+        "taxa": taxa * 100,
+        "depreciacao": depreciacao,
+        "valor_contabil": valor_contabil,
+    }
+
+
+def calcular_resultado(
+    investimento,
+    prazo,
+    aluguel,
+    custos_operacionais,
+    imposto_pct,
+    comissao_pct,
+    margem_desejada,
+    custo_financeiro=0.0,
+    reserva_risco=0.0,
+):
+    receita = aluguel * prazo
+    impostos = receita * imposto_pct / 100
+    comissao = receita * comissao_pct / 100
+    custo_total = (
+        investimento
+        + custos_operacionais
+        + custo_financeiro
+        + reserva_risco
+    )
+    lucro = receita - custo_total - impostos - comissao
+    margem = lucro / receita * 100 if receita else 0
+
+    fluxo_mensal = (
+        aluguel
+        - impostos / prazo
+        - comissao / prazo
+        - custos_operacionais / prazo
+        - custo_financeiro / prazo
+        - reserva_risco / prazo
+    )
+    payback = investimento / fluxo_mensal if fluxo_mensal > 0 else 999
+
+    denominador = (
+        1
+        - imposto_pct / 100
+        - comissao_pct / 100
+        - margem_desejada / 100
+    )
+    aluguel_minimo = (
+        (custo_total / prazo) / denominador
+        if denominador > 0 and prazo > 0
+        else 0.0
+    )
+
+    return {
+        "receita": receita,
+        "impostos": impostos,
+        "comissao": comissao,
+        "custo_total": custo_total,
+        "lucro": lucro,
+        "margem": margem,
+        "payback": payback,
+        "aluguel_minimo": aluguel_minimo,
+    }
+
+
+def calcular_reforma(
+    receita,
+    base_credito,
+    cbs,
+    ibs,
+    credito_pct,
+    demais_custos,
+):
+    aliquota = cbs + ibs
+    tributo_bruto = receita * aliquota / 100
+    credito = base_credito * aliquota / 100 * credito_pct / 100
+    tributo_liquido = max(tributo_bruto - credito, 0)
+    lucro = receita - demais_custos - tributo_liquido
+
+    return {
+        "aliquota": aliquota,
+        "tributo_bruto": tributo_bruto,
+        "credito": credito,
+        "tributo_liquido": tributo_liquido,
+        "lucro": lucro,
+    }
+
+# ======================================================
+# PTAX
+# ======================================================
+@st.cache_data(ttl=3600, show_spinner=False)
 def ptax():
-    fim=date.today(); ini=fim-timedelta(days=10)
-    url=('https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/'
-         'CotacaoDolarPeriodo(dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)'
-         f"?@dataInicial='{ini.strftime('%m-%d-%Y')}'&@dataFinalCotacao='{fim.strftime('%m-%d-%Y')}'"
-         '&$top=100&$orderby=dataHoraCotacao%20desc&$format=json&$select=cotacaoVenda,dataHoraCotacao')
-    r=requests.get(url,timeout=12); r.raise_for_status(); vals=r.json().get('value',[])
-    if not vals: raise RuntimeError('sem cotação')
-    x=vals[0]; dt=pd.to_datetime(x['dataHoraCotacao'],errors='coerce')
-    return float(x['cotacaoVenda']), (dt.strftime('%d/%m/%Y %H:%M') if not pd.isna(dt) else '')
+    fim = date.today()
+    ini = fim - timedelta(days=10)
+    url = (
+        "https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/"
+        "CotacaoDolarPeriodo(dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)"
+        f"?@dataInicial='{ini.strftime('%m-%d-%Y')}'"
+        f"&@dataFinalCotacao='{fim.strftime('%m-%d-%Y')}'"
+        "&$top=100&$orderby=dataHoraCotacao%20desc"
+        "&$format=json&$select=cotacaoVenda,dataHoraCotacao"
+    )
+    r = requests.get(url, timeout=12)
+    r.raise_for_status()
+    valores = r.json().get("value", [])
+    if not valores:
+        raise RuntimeError("sem cotação")
+    reg = valores[0]
+    dt = pd.to_datetime(reg["dataHoraCotacao"], errors="coerce")
+    return float(reg["cotacaoVenda"]), (
+        dt.strftime("%d/%m/%Y %H:%M")
+        if not pd.isna(dt)
+        else ""
+    )
 
+# ======================================================
+# ATIVOS
+# ======================================================
 @st.cache_data
-def ativos():
-    p=Path(ATIVOS)
-    if not p.exists(): return pd.DataFrame()
-    for kw in [dict(sep=None,engine='python',encoding='utf-8-sig'),dict(sep=';',encoding='latin1')]:
-        try:return pd.read_csv(p,**kw).fillna('')
-        except:pass
+def carregar_ativos():
+    p = Path(ATIVOS_CSV)
+    if not p.exists():
+        return pd.DataFrame()
+    for params in [
+        dict(sep=None, engine="python", encoding="utf-8-sig"),
+        dict(sep=";", encoding="latin1"),
+    ]:
+        try:
+            return pd.read_csv(p, **params).fillna("")
+        except Exception:
+            pass
     return pd.DataFrame()
-def col(r,nomes,default=''):
-    for n in nomes:
-        if n in r.index and pd.notna(r[n]):return r[n]
+
+
+def coluna(row, nomes, default=""):
+    for nome in nomes:
+        if nome in row.index and pd.notna(row[nome]):
+            return row[nome]
     return default
-def ativo_info(r):
-    return {'equipamento':str(col(r,['Descricao','Descrição','Desc Bem','descricao','Produto'],'')),'fabricante':str(col(r,['Marca','Fabricante','marca'],'')),'valor':parse(col(r,['Valor_Aquisicao','Valor Aquisição','Vl Aquisicao','Vl_Aquisicao','valor_aquisicao'],0)),'codigo':str(col(r,['Codigo','Código','Cod Bem','Cod_Bem','codigo'],''))}
-def label(r):
-    a=ativo_info(r); return f"{a['codigo']} | {a['equipamento'][:65]} | {moeda(a['valor'])}"
 
-st.sidebar.markdown('## FIRST MEDICAL\n### Precificação de Locação\n---')
-menu=st.sidebar.radio('Menu',['Visão Geral','1 - Locação de Novos','2 - Locação de Usados','3 - Ativos','4 - Histórico','5 - Parâmetros'])
 
-if menu=='Visão Geral':
-    st.markdown('<div class="hero"><h1>Precificação de Locação</h1><p>Equipamentos novos e usados em fluxos independentes.</p></div>',unsafe_allow_html=True)
-    h=hist(); cols=st.columns(4)
-    vals=[('Precificações',len(h),'Registros salvos'),('Novos',int((h.tipo=='Novo').sum()) if not h.empty else 0,'Equipamentos novos'),('Usados',int((h.tipo=='Usado').sum()) if not h.empty else 0,'Equipamentos usados'),('Margem média',perc(h.margem.mean()) if not h.empty else '0,00%','Histórico')]
-    for c,x in zip(cols,vals):
-        with c: card(*x)
+def ativo_info(row):
+    valor = parse(
+        coluna(
+            row,
+            [
+                "Valor_Aquisicao",
+                "Valor Aquisição",
+                "Vl Aquisicao",
+                "Vl_Aquisicao",
+                "valor_aquisicao",
+            ],
+            0,
+        )
+    )
+    data_aquisicao = coluna(
+        row,
+        [
+            "Data Aquisicao",
+            "Dt Aquisicao",
+            "Data_Aquisicao",
+            "data_aquisicao",
+        ],
+        "",
+    )
+    dt = pd.to_datetime(data_aquisicao, errors="coerce", dayfirst=True)
+
+    return {
+        "equipamento": str(
+            coluna(
+                row,
+                ["Descricao", "Descrição", "Desc Bem", "descricao", "Produto"],
+                "",
+            )
+        ),
+        "fabricante": str(
+            coluna(row, ["Marca", "Fabricante", "marca"], "")
+        ),
+        "valor": valor,
+        "codigo": str(
+            coluna(
+                row,
+                ["Codigo", "Código", "Cod Bem", "Cod_Bem", "codigo"],
+                "",
+            )
+        ),
+        "data_aquisicao": (
+            dt.strftime("%d/%m/%Y")
+            if not pd.isna(dt)
+            else ""
+        ),
+    }
+
+
+def label_ativo(row):
+    info = ativo_info(row)
+    return (
+        f"{info['codigo']} | {info['equipamento'][:65]} | "
+        f"{moeda(info['valor'])}"
+    )
+
+# ======================================================
+# MENU
+# ======================================================
+st.sidebar.markdown("## FIRST MEDICAL")
+st.sidebar.markdown("### Precificação de Locação")
+st.sidebar.markdown("---")
+
+menu = st.sidebar.radio(
+    "Menu",
+    [
+        "Resumo Executivo",
+        "1 - Locação de Novos",
+        "2 - Locação de Usados",
+        "3 - Ativos",
+        "4 - Histórico",
+        "5 - Parâmetros",
+    ],
+)
+
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    "Atual | Pós-reforma | Novos | Usados"
+)
+
+# ======================================================
+# RESUMO EXECUTIVO
+# ======================================================
+if menu == "Resumo Executivo":
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>Resumo Executivo</h1>
+            <p>Histórico consolidado de equipamentos novos e usados.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    h = historico()
+
+    indicadores = [
+        ("Precificações", len(h), "Registros salvos"),
+        (
+            "Aluguel médio",
+            moeda(h["aluguel"].mean()) if not h.empty else moeda(0),
+            "Contratos simulados",
+        ),
+        (
+            "Margem média",
+            perc(h["margem"].mean()) if not h.empty else "0,00%",
+            "Cenário atual",
+        ),
+        (
+            "Payback médio",
+            meses(h[h["payback"] < 900]["payback"].mean())
+            if not h.empty and (h["payback"] < 900).any()
+            else "N/A",
+            "Registros recuperáveis",
+        ),
+    ]
+
+    cols = st.columns(4)
+    for col, item in zip(cols, indicadores):
+        with col:
+            card(*item)
+
     if not h.empty:
-        st.bar_chart(h.head(20)[['equipamento','margem']].set_index('equipamento'))
-        v=h[['data_hora','tipo','cliente','equipamento','prazo','aluguel','lucro','margem']].head(15).copy(); v['aluguel']=v.aluguel.map(moeda); v['lucro']=v.lucro.map(moeda); v['margem']=v.margem.map(perc); st.dataframe(v,use_container_width=True,hide_index=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(
+                '<div class="section-title">Lucro por precificação</div>',
+                unsafe_allow_html=True,
+            )
+            st.bar_chart(
+                h.head(20)[
+                    ["equipamento", "lucro"]
+                ].set_index("equipamento")
+            )
 
-elif menu=='1 - Locação de Novos':
-    st.markdown('<div class="hero"><h1>Locação de Equipamentos Novos</h1><p>FOB em dólar, nacionalização, financiamento, impostos e comissão.</p></div>',unsafe_allow_html=True)
-    try: dolar0,dt=ptax(); st.success(f'Dólar PTAX de venda: R$ {dolar0:.4f} em {dt}')
-    except: dolar0=5.50; st.warning('Não foi possível consultar a PTAX. Informe a cotação manualmente.')
-    with st.form('novos'):
-        c1,c2,c3=st.columns(3); cliente=c1.text_input('Cliente'); equipamento=c2.text_input('Equipamento'); fabricante=c3.text_input('Fabricante / linha')
-        c1,c2,c3=st.columns(3); resp=c1.text_input('Vendedor / representante'); prazo=c2.number_input('Prazo (meses)',1,120,24); c3.date_input('Data',date.today(),format='DD/MM/YYYY')
-        st.markdown('<div class="section-title">Importação e nacionalização</div>',unsafe_allow_html=True)
-        c1,c2,c3=st.columns(3); fob=c1.number_input('Valor FOB (US$)',0.0,step=100.0,format='%.2f'); dolar=c2.number_input('Dólar utilizado (R$)',0.01,value=float(dolar0),step=0.01,format='%.4f'); nac=c3.number_input('Nacionalização (%)',0.0,value=NAC,step=1.0)
-        fob_brl=fob*dolar; custo_nac=fob_brl*nac/100; investimento=fob_brl+custo_nac; st.info(f'FOB convertido: {moeda(fob_brl)} | Nacionalização: {moeda(custo_nac)} | Investimento: {moeda(investimento)}')
-        st.markdown('<div class="section-title">Origem do investimento</div>',unsafe_allow_html=True)
-        origem=st.radio('Origem',['Capital próprio','Financiamento bancário'],horizontal=True)
-        custo_fin=0; entrada=0; financiado=0; taxa=TAXA_FIN; prazo_fin=PRAZO_FIN; parcela=0
-        if origem=='Financiamento bancário':
-            c1,c2,c3=st.columns(3)
-            with c1: entrada=input_rs('Entrada',0,'n_ent')
-            with c2: financiado=input_rs('Valor financiado',max(investimento-entrada,0),'n_fin')
-            prazo_fin=c3.number_input('Prazo financiamento',1,120,PRAZO_FIN)
-            c1,c2=st.columns(2); taxa=c1.number_input('Taxa mensal (%)',0.0,value=TAXA_FIN,step=0.1); parcela=price(financiado,taxa,prazo_fin); custo_fin=max(parcela*prazo_fin-financiado,0); c2.metric('Parcela estimada',moeda(parcela)); st.info(f'Custo financeiro total: {moeda(custo_fin)}')
-        st.markdown('<div class="section-title">Comissão</div>',unsafe_allow_html=True)
-        tipo=st.radio('Modelo',['Vendedor + gerente','Representante','Sem comissão'],horizontal=True); c1,c2,c3=st.columns(3); cv=c1.number_input('Vendedor (%)',0.0,value=CV,step=0.25,disabled=tipo!='Vendedor + gerente'); cg=c2.number_input('Gerente (%)',0.0,value=CG,step=0.25,disabled=tipo!='Vendedor + gerente'); cr=c3.number_input('Representante (%)',0.0,value=CR,step=0.5,disabled=tipo!='Representante'); cp=com_pct(tipo,cv,cg,cr)
-        c1,c2,c3=st.columns(3)
-        with c1: aluguel=input_rs('Aluguel mensal',0,'n_alug')
-        with c2: despesas=input_rs('Despesas adicionais totais',0,'n_desp')
-        margem=c3.number_input('Margem desejada (%)',0.0,value=MARGEM,step=1.0)
-        st.number_input('Impostos sobre locação (%)',value=IMP,disabled=True)
-        ok=st.form_submit_button('Calcular precificação',use_container_width=True)
+        with col2:
+            st.markdown(
+                '<div class="section-title">Margem por tipo</div>',
+                unsafe_allow_html=True,
+            )
+            margem_tipo = (
+                h.groupby("tipo", as_index=False)["margem"]
+                .mean()
+                .set_index("tipo")
+            )
+            st.bar_chart(margem_tipo)
+
+        st.markdown(
+            '<div class="section-title">Últimas precificações</div>',
+            unsafe_allow_html=True,
+        )
+        view = h[
+            [
+                "data_hora",
+                "tipo",
+                "cliente",
+                "equipamento",
+                "prazo",
+                "aluguel",
+                "aluguel_minimo",
+                "lucro",
+                "margem",
+                "payback",
+            ]
+        ].head(20)
+
+        st.dataframe(
+            tabela_formatada(
+                view,
+                money=[
+                    "aluguel",
+                    "aluguel_minimo",
+                    "lucro",
+                ],
+                percent=["margem"],
+                months=["payback"],
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+# ======================================================
+# NOVOS
+# ======================================================
+elif menu == "1 - Locação de Novos":
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>Locação de Equipamentos Novos</h1>
+            <p>FOB, dólar, nacionalização, financiamento, impostos e pós-reforma.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    try:
+        dolar_padrao, data_ptax = ptax()
+        st.success(
+            f"PTAX de venda: R$ {dolar_padrao:.4f} em {data_ptax}"
+        )
+    except Exception:
+        dolar_padrao = 5.50
+        st.warning(
+            "Não foi possível consultar a PTAX. "
+            "Informe a cotação manualmente."
+        )
+
+    with st.form("novos"):
+        col1, col2, col3 = st.columns(3)
+        cliente = col1.text_input("Cliente")
+        equipamento = col2.text_input("Equipamento")
+        fabricante = col3.text_input("Fabricante / linha")
+
+        col1, col2, col3 = st.columns(3)
+        responsavel = col1.text_input("Vendedor / representante")
+        prazo = col2.number_input(
+            "Prazo (meses)", 1, 120, 24
+        )
+        data_inicio = col3.date_input(
+            "Início da locação",
+            date.today(),
+            format="DD/MM/YYYY",
+        )
+
+        st.markdown(
+            '<div class="section-title">Importação e nacionalização</div>',
+            unsafe_allow_html=True,
+        )
+        col1, col2, col3 = st.columns(3)
+        fob = col1.number_input(
+            "Valor FOB (US$)",
+            0.0,
+            step=100.0,
+            format="%.2f",
+        )
+        dolar = col2.number_input(
+            "Dólar utilizado (R$)",
+            0.01,
+            value=float(dolar_padrao),
+            step=0.01,
+            format="%.4f",
+        )
+        nacionalizacao = col3.number_input(
+            "Nacionalização (%)",
+            0.0,
+            value=NACIONALIZACAO_PADRAO,
+            step=1.0,
+        )
+
+        fob_reais = fob * dolar
+        custo_nac = fob_reais * nacionalizacao / 100
+        investimento = fob_reais + custo_nac
+
+        st.info(
+            f"FOB convertido: {moeda(fob_reais)} | "
+            f"Nacionalização: {moeda(custo_nac)} | "
+            f"Investimento: {moeda(investimento)}"
+        )
+
+        st.markdown(
+            '<div class="section-title">Origem do investimento</div>',
+            unsafe_allow_html=True,
+        )
+        origem = st.radio(
+            "Origem",
+            ["Capital próprio", "Financiamento bancário"],
+            horizontal=True,
+        )
+
+        custo_financeiro = 0.0
+        parcela = 0.0
+        valor_financiado = 0.0
+        taxa_fin = TAXA_FINANCIAMENTO
+        prazo_fin = PRAZO_FINANCIAMENTO
+
+        if origem == "Financiamento bancário":
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                entrada = input_rs(
+                    "Entrada",
+                    0,
+                    "novo_entrada",
+                )
+            with col2:
+                valor_financiado = input_rs(
+                    "Valor financiado",
+                    max(investimento - entrada, 0),
+                    "novo_financiado",
+                )
+            prazo_fin = col3.number_input(
+                "Prazo financiamento",
+                1,
+                120,
+                PRAZO_FINANCIAMENTO,
+            )
+
+            col1, col2 = st.columns(2)
+            taxa_fin = col1.number_input(
+                "Taxa mensal (%)",
+                0.0,
+                value=TAXA_FINANCIAMENTO,
+                step=0.1,
+            )
+            parcela = price(
+                valor_financiado,
+                taxa_fin,
+                prazo_fin,
+            )
+            custo_financeiro = max(
+                parcela * prazo_fin - valor_financiado,
+                0,
+            )
+            col2.metric(
+                "Parcela estimada",
+                moeda(parcela),
+            )
+
+        st.markdown(
+            '<div class="section-title">Comissão</div>',
+            unsafe_allow_html=True,
+        )
+        tipo_comissao = st.radio(
+            "Modelo",
+            [
+                "Vendedor + gerente",
+                "Representante",
+                "Sem comissão",
+            ],
+            horizontal=True,
+        )
+        col1, col2, col3 = st.columns(3)
+        cv = col1.number_input(
+            "Vendedor (%)",
+            0.0,
+            value=COMISSAO_VENDEDOR,
+            step=0.25,
+            disabled=tipo_comissao != "Vendedor + gerente",
+        )
+        cg = col2.number_input(
+            "Gerente (%)",
+            0.0,
+            value=COMISSAO_GERENTE,
+            step=0.25,
+            disabled=tipo_comissao != "Vendedor + gerente",
+        )
+        cr = col3.number_input(
+            "Representante (%)",
+            0.0,
+            value=COMISSAO_REPRESENTANTE,
+            step=0.5,
+            disabled=tipo_comissao != "Representante",
+        )
+        com_pct = comissao_total(
+            tipo_comissao,
+            cv,
+            cg,
+            cr,
+        )
+
+        st.markdown(
+            '<div class="section-title">Receita e cenário pós-reforma</div>',
+            unsafe_allow_html=True,
+        )
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            aluguel = input_rs(
+                "Aluguel mensal",
+                0,
+                "novo_aluguel",
+            )
+        with col2:
+            despesas = input_rs(
+                "Despesas adicionais totais",
+                0,
+                "novo_despesas",
+            )
+        margem = col3.number_input(
+            "Margem desejada (%)",
+            0.0,
+            value=MARGEM_PADRAO,
+            step=1.0,
+        )
+
+        col1, col2, col3 = st.columns(3)
+        cbs = col1.number_input(
+            "CBS estimada (%)",
+            value=CBS_PADRAO,
+            step=0.1,
+        )
+        ibs = col2.number_input(
+            "IBS estimado (%)",
+            value=IBS_PADRAO,
+            step=0.1,
+        )
+        credito_pct = col3.number_input(
+            "Crédito estimado (%)",
+            value=CREDITO_PADRAO,
+            step=5.0,
+        )
+
+        st.number_input(
+            "Impostos atuais (%)",
+            value=IMPOSTO_ATUAL,
+            disabled=True,
+        )
+
+        ok = st.form_submit_button(
+            "Calcular precificação",
+            use_container_width=True,
+        )
+
     if ok:
-        r=calc(investimento,int(prazo),aluguel,despesas,IMP,cp,margem,custo_fin); cols=st.columns(4); dados=[('Investimento',moeda(investimento),'FOB + nacionalização'),('Aluguel mínimo',moeda(r['minimo']),f'Margem {perc(margem)}'),('Lucro',moeda(r['lucro']),'Com aluguel informado'),('Margem',perc(r['margem']),'Lucro sobre receita')]
-        for c,x in zip(cols,dados):
-            with c: card(*x)
-        cols=st.columns(4); dados=[('Receita total',moeda(r['receita']),f'{prazo} meses'),('Impostos',moeda(r['impostos']),'14,30%'),('Comissão',moeda(r['comissao']),perc(cp)),('Custo financeiro',moeda(custo_fin),origem)]
-        for c,x in zip(cols,dados):
-            with c: card(*x)
-        if st.button('Salvar precificação de novo',use_container_width=True):
-            salvar(dict(data_hora=datetime.now().strftime('%d/%m/%Y %H:%M:%S'),tipo='Novo',cliente=cliente,equipamento=equipamento,fabricante=fabricante,responsavel=resp,prazo=int(prazo),investimento=investimento,aluguel=aluguel,receita=r['receita'],custos=r['custos'],impostos=r['impostos'],comissao=r['comissao'],lucro=r['lucro'],margem=r['margem'],aluguel_minimo=r['minimo'],origem=origem,detalhes=json.dumps({'fob_usd':fob,'dolar':dolar,'nacionalizacao':nac,'modelo_comissao':tipo,'comissao_pct':cp,'parcela':parcela},ensure_ascii=False))); st.success('Precificação salva.')
+        atual = calcular_resultado(
+            investimento,
+            int(prazo),
+            aluguel,
+            despesas,
+            IMPOSTO_ATUAL,
+            com_pct,
+            margem,
+            custo_financeiro,
+        )
 
-elif menu=='2 - Locação de Usados':
-    st.markdown('<div class="hero"><h1>Locação de Equipamentos Usados</h1><p>Manutenção, peças, horas técnicas, impostos e comissão.</p></div>',unsafe_allow_html=True)
-    a=ativos(); info={}
-    if not a.empty:
-        busca=st.text_input('Buscar ativo'); f=a.copy()
-        if busca: f=f[f.astype(str).apply(lambda x:x.str.contains(busca,case=False,na=False)).any(axis=1)]
-        opts=['Não selecionar']+[label(r) for _,r in f.head(300).iterrows()]; sel=st.selectbox('Selecionar ativo',opts)
-        if sel!='Não selecionar': info=ativo_info(f.iloc[opts.index(sel)-1]); st.success(f"Ativo: {info['equipamento']} | Aquisição: {moeda(info['valor'])}")
-    with st.form('usados'):
-        c1,c2,c3=st.columns(3); cliente=c1.text_input('Cliente'); equipamento=c2.text_input('Equipamento',value=info.get('equipamento','')); fabricante=c3.text_input('Fabricante / linha',value=info.get('fabricante',''))
-        c1,c2,c3=st.columns(3); resp=c1.text_input('Vendedor / representante'); prazo=c2.number_input('Prazo (meses)',1,120,24); c3.date_input('Data',date.today(),format='DD/MM/YYYY')
-        st.markdown('<div class="section-title">Custos para manter funcionando</div>',unsafe_allow_html=True)
-        c1,c2,c3=st.columns(3)
-        with c1: manut=input_rs('Manutenção mensal',0,'u_man')
-        with c2: pecas=input_rs('Peças / consumíveis mensais',0,'u_pec')
-        with c3: seguro=input_rs('Seguro mensal',0,'u_seg')
-        c1,c2,c3=st.columns(3); horas=c1.number_input('Horas técnicas por mês',0.0,step=1.0)
-        with c2: vh=input_rs('Valor da hora técnica',0,'u_hora')
-        with c3: desloc=input_rs('Deslocamento mensal',0,'u_desl')
-        c1,c2,c3=st.columns(3)
-        with c1: revisao=input_rs('Revisão inicial / recuperação',0,'u_rev')
-        with c2: outros=input_rs('Outros custos mensais',0,'u_out')
-        recuperar=c3.checkbox('Recuperar valor contábil no contrato',False)
-        valor_ativo=info.get('valor',0.0)
-        if recuperar: valor_ativo=input_rs('Valor-base do ativo',valor_ativo,'u_valor')
-        st.markdown('<div class="section-title">Comissão</div>',unsafe_allow_html=True)
-        tipo=st.radio('Modelo',['Vendedor + gerente','Representante','Sem comissão'],horizontal=True,key='u_tipo'); c1,c2,c3=st.columns(3); cv=c1.number_input('Vendedor (%)',0.0,value=CV,step=0.25,disabled=tipo!='Vendedor + gerente',key='u_cv'); cg=c2.number_input('Gerente (%)',0.0,value=CG,step=0.25,disabled=tipo!='Vendedor + gerente',key='u_cg'); cr=c3.number_input('Representante (%)',0.0,value=CR,step=0.5,disabled=tipo!='Representante',key='u_cr'); cp=com_pct(tipo,cv,cg,cr)
-        c1,c2=st.columns(2)
-        with c1: aluguel=input_rs('Aluguel mensal',0,'u_alug')
-        margem=c2.number_input('Margem desejada (%)',0.0,value=MARGEM,step=1.0)
-        st.number_input('Impostos sobre locação (%)',value=IMP,disabled=True,key='u_imp'); ok=st.form_submit_button('Calcular precificação',use_container_width=True)
+        base_credito = investimento + despesas
+        demais_custos_reforma = (
+            investimento
+            + despesas
+            + custo_financeiro
+            + atual["comissao"]
+        )
+        reforma = calcular_reforma(
+            atual["receita"],
+            base_credito,
+            cbs,
+            ibs,
+            credito_pct,
+            demais_custos_reforma,
+        )
+
+        st.markdown(
+            '<div class="section-title">Resumo executivo</div>',
+            unsafe_allow_html=True,
+        )
+        cards = [
+            (
+                "Investimento",
+                moeda(investimento),
+                "FOB + nacionalização",
+            ),
+            (
+                "Aluguel mínimo",
+                moeda(atual["aluguel_minimo"]),
+                f"Margem {perc(margem)}",
+            ),
+            (
+                "Lucro atual",
+                moeda(atual["lucro"]),
+                "Impostos atuais",
+            ),
+            (
+                "Payback",
+                meses(atual["payback"]),
+                "Recuperação do investimento",
+            ),
+        ]
+        cols = st.columns(4)
+        for c, item in zip(cols, cards):
+            with c:
+                card(*item)
+
+        st.markdown(
+            '<div class="section-title">Cenário atual x pós-reforma</div>',
+            unsafe_allow_html=True,
+        )
+        cards = [
+            (
+                "Impostos atuais",
+                moeda(atual["impostos"]),
+                "14,30%",
+            ),
+            (
+                "IBS/CBS bruto",
+                moeda(reforma["tributo_bruto"]),
+                perc(reforma["aliquota"]),
+            ),
+            (
+                "Crédito estimado",
+                moeda(reforma["credito"]),
+                perc(credito_pct),
+            ),
+            (
+                "Lucro pós-reforma",
+                moeda(reforma["lucro"]),
+                "Após créditos",
+            ),
+        ]
+        cols = st.columns(4)
+        for c, item in zip(cols, cards):
+            with c:
+                card(*item)
+
+        if st.button(
+            "Salvar precificação de novo",
+            use_container_width=True,
+        ):
+            salvar(
+                {
+                    "data_hora": datetime.now().strftime(
+                        "%d/%m/%Y %H:%M:%S"
+                    ),
+                    "tipo": "Novo",
+                    "cliente": cliente,
+                    "equipamento": equipamento,
+                    "fabricante": fabricante,
+                    "responsavel": responsavel,
+                    "prazo": int(prazo),
+                    "investimento": investimento,
+                    "aluguel": aluguel,
+                    "receita": atual["receita"],
+                    "custos": atual["custo_total"],
+                    "impostos": atual["impostos"],
+                    "comissao": atual["comissao"],
+                    "lucro": atual["lucro"],
+                    "margem": atual["margem"],
+                    "payback": atual["payback"],
+                    "aluguel_minimo": atual["aluguel_minimo"],
+                    "depreciacao": 0.0,
+                    "valor_contabil": investimento,
+                    "lucro_reforma": reforma["lucro"],
+                    "origem": origem,
+                    "detalhes": json.dumps(
+                        {
+                            "fob_usd": fob,
+                            "dolar": dolar,
+                            "nacionalizacao": nacionalizacao,
+                            "comissao_pct": com_pct,
+                            "cbs": cbs,
+                            "ibs": ibs,
+                            "credito_pct": credito_pct,
+                            "inicio": data_inicio.strftime(
+                                "%d/%m/%Y"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+            st.success("Precificação salva.")
+
+# ======================================================
+# USADOS
+# ======================================================
+elif menu == "2 - Locação de Usados":
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>Locação de Equipamentos Usados</h1>
+            <p>Custo de propriedade + custo operacional + risco + margem.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    ativos = carregar_ativos()
+    info = {}
+
+    if not ativos.empty:
+        busca = st.text_input("Buscar ativo")
+        filtrados = ativos.copy()
+        if busca:
+            filtrados = filtrados[
+                filtrados.astype(str)
+                .apply(
+                    lambda x: x.str.contains(
+                        busca,
+                        case=False,
+                        na=False,
+                    )
+                )
+                .any(axis=1)
+            ]
+
+        opcoes = ["Não selecionar"] + [
+            label_ativo(row)
+            for _, row in filtrados.head(300).iterrows()
+        ]
+        selecionado = st.selectbox(
+            "Selecionar ativo",
+            opcoes,
+        )
+        if selecionado != "Não selecionar":
+            info = ativo_info(
+                filtrados.iloc[
+                    opcoes.index(selecionado) - 1
+                ]
+            )
+            st.success(
+                f"Ativo: {info['equipamento']} | "
+                f"Aquisição: {moeda(info['valor'])} | "
+                f"Data: {info['data_aquisicao'] or 'não informada'}"
+            )
+
+    with st.form("usados"):
+        col1, col2, col3 = st.columns(3)
+        cliente = col1.text_input("Cliente")
+        equipamento = col2.text_input(
+            "Equipamento",
+            value=info.get("equipamento", ""),
+        )
+        fabricante = col3.text_input(
+            "Fabricante / linha",
+            value=info.get("fabricante", ""),
+        )
+
+        col1, col2, col3 = st.columns(3)
+        responsavel = col1.text_input(
+            "Vendedor / representante"
+        )
+        prazo = col2.number_input(
+            "Prazo (meses)",
+            1,
+            120,
+            24,
+        )
+        data_inicio = col3.date_input(
+            "Início da locação",
+            date.today(),
+            format="DD/MM/YYYY",
+        )
+
+        st.markdown(
+            '<div class="section-title">Ativo e depreciação</div>',
+            unsafe_allow_html=True,
+        )
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            valor_ativo = input_rs(
+                "Valor de aquisição",
+                info.get("valor", 0.0),
+                "usado_valor",
+            )
+
+        data_aq_default = pd.to_datetime(
+            info.get("data_aquisicao", ""),
+            errors="coerce",
+            dayfirst=True,
+        )
+        if pd.isna(data_aq_default):
+            data_aq_default = pd.Timestamp(date.today())
+
+        data_aquisicao = col2.date_input(
+            "Data de aquisição",
+            value=data_aq_default.date(),
+            format="DD/MM/YYYY",
+        )
+        vida_util = col3.number_input(
+            "Vida útil (anos)",
+            1.0,
+            value=VIDA_UTIL_PADRAO,
+            step=0.5,
+        )
+
+        st.markdown(
+            '<div class="section-title">Custo operacional</div>',
+            unsafe_allow_html=True,
+        )
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            manutencao = input_rs(
+                "Manutenção mensal",
+                0,
+                "u_manut",
+            )
+        with col2:
+            pecas = input_rs(
+                "Peças / consumíveis mensais",
+                0,
+                "u_pecas",
+            )
+        with col3:
+            seguro = input_rs(
+                "Seguro mensal",
+                0,
+                "u_seguro",
+            )
+
+        col1, col2, col3 = st.columns(3)
+        horas_tecnico = col1.number_input(
+            "Horas técnicas por mês",
+            0.0,
+            step=1.0,
+        )
+        with col2:
+            valor_hora = input_rs(
+                "Valor da hora técnica",
+                0,
+                "u_hora",
+            )
+        with col3:
+            deslocamento = input_rs(
+                "Deslocamento mensal",
+                0,
+                "u_desloc",
+            )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            revisao_inicial = input_rs(
+                "Revisão inicial / recuperação",
+                0,
+                "u_revisao",
+            )
+        with col2:
+            outros = input_rs(
+                "Outros custos mensais",
+                0,
+                "u_outros",
+            )
+        reserva_risco_pct = col3.number_input(
+            "Reserva técnica / indisponibilidade (%)",
+            0.0,
+            value=5.0,
+            step=0.5,
+            help=(
+                "Reserva gerencial sobre os custos operacionais "
+                "para falhas, indisponibilidade e substituições."
+            ),
+        )
+
+        st.markdown(
+            '<div class="section-title">Modelo de recuperação do ativo</div>',
+            unsafe_allow_html=True,
+        )
+        modelo_usado = st.radio(
+            "Base da precificação",
+            [
+                "Somente custos incrementais",
+                "Custos + depreciação do contrato",
+                "Custos + valor contábil integral",
+            ],
+            horizontal=True,
+        )
+
+        st.markdown(
+            '<div class="section-title">Comissão</div>',
+            unsafe_allow_html=True,
+        )
+        tipo_comissao = st.radio(
+            "Modelo",
+            [
+                "Vendedor + gerente",
+                "Representante",
+                "Sem comissão",
+            ],
+            horizontal=True,
+            key="comissao_usados",
+        )
+        col1, col2, col3 = st.columns(3)
+        cv = col1.number_input(
+            "Vendedor (%)",
+            0.0,
+            value=COMISSAO_VENDEDOR,
+            step=0.25,
+            disabled=tipo_comissao != "Vendedor + gerente",
+            key="ucv",
+        )
+        cg = col2.number_input(
+            "Gerente (%)",
+            0.0,
+            value=COMISSAO_GERENTE,
+            step=0.25,
+            disabled=tipo_comissao != "Vendedor + gerente",
+            key="ucg",
+        )
+        cr = col3.number_input(
+            "Representante (%)",
+            0.0,
+            value=COMISSAO_REPRESENTANTE,
+            step=0.5,
+            disabled=tipo_comissao != "Representante",
+            key="ucr",
+        )
+        com_pct = comissao_total(
+            tipo_comissao,
+            cv,
+            cg,
+            cr,
+        )
+
+        st.markdown(
+            '<div class="section-title">Receita e pós-reforma</div>',
+            unsafe_allow_html=True,
+        )
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            aluguel = input_rs(
+                "Aluguel mensal",
+                0,
+                "u_aluguel",
+            )
+        margem = col2.number_input(
+            "Margem desejada (%)",
+            0.0,
+            value=MARGEM_PADRAO,
+            step=1.0,
+        )
+        imposto = col3.number_input(
+            "Impostos atuais (%)",
+            value=IMPOSTO_ATUAL,
+            disabled=True,
+        )
+
+        col1, col2, col3 = st.columns(3)
+        cbs = col1.number_input(
+            "CBS estimada (%)",
+            value=CBS_PADRAO,
+            step=0.1,
+            key="ucbs",
+        )
+        ibs = col2.number_input(
+            "IBS estimado (%)",
+            value=IBS_PADRAO,
+            step=0.1,
+            key="uibs",
+        )
+        credito_pct = col3.number_input(
+            "Crédito estimado (%)",
+            value=CREDITO_PADRAO,
+            step=5.0,
+            key="ucredito",
+        )
+
+        ok = st.form_submit_button(
+            "Calcular precificação",
+            use_container_width=True,
+        )
+
     if ok:
-        tecnico=horas*vh; mensal=manut+pecas+seguro+tecnico+desloc+outros; contrato=mensal*prazo+revisao; investimento=valor_ativo if recuperar else 0; r=calc(investimento,int(prazo),aluguel,contrato,IMP,cp,margem,0)
-        cols=st.columns(4); dados=[('Custo operacional mensal',moeda(mensal),'Manutenção + técnico'),('Aluguel mínimo',moeda(r['minimo']),f'Margem {perc(margem)}'),('Lucro',moeda(r['lucro']),'Com aluguel informado'),('Margem',perc(r['margem']),'Lucro sobre receita')]
-        for c,x in zip(cols,dados):
-            with c: card(*x)
-        cols=st.columns(4); dados=[('Horas técnicas',f'{horas:.1f} h/mês',moeda(tecnico)),('Custos no contrato',moeda(contrato),f'{prazo} meses'),('Impostos',moeda(r['impostos']),'14,30%'),('Comissão',moeda(r['comissao']),perc(cp))]
-        for c,x in zip(cols,dados):
-            with c: card(*x)
-        if st.button('Salvar precificação de usado',use_container_width=True):
-            salvar(dict(data_hora=datetime.now().strftime('%d/%m/%Y %H:%M:%S'),tipo='Usado',cliente=cliente,equipamento=equipamento,fabricante=fabricante,responsavel=resp,prazo=int(prazo),investimento=investimento,aluguel=aluguel,receita=r['receita'],custos=r['custos'],impostos=r['impostos'],comissao=r['comissao'],lucro=r['lucro'],margem=r['margem'],aluguel_minimo=r['minimo'],origem='Ativo próprio',detalhes=json.dumps({'manutencao_mensal':manut,'pecas_mensais':pecas,'horas_tecnico':horas,'valor_hora':vh,'custo_tecnico':tecnico,'modelo_comissao':tipo,'comissao_pct':cp},ensure_ascii=False))); st.success('Precificação salva.')
+        dep = calcular_depreciacao(
+            valor_ativo,
+            data_aquisicao,
+            data_inicio,
+            int(prazo),
+            vida_util,
+        )
 
-elif menu=='3 - Ativos':
-    st.markdown('<div class="hero"><h1>Ativos</h1><p>Consulta da base pré-cadastrada.</p></div>',unsafe_allow_html=True); a=ativos()
-    if a.empty: st.warning('Arquivo ativos_pre_cadastro.csv não encontrado ou vazio.')
+        custo_tecnico = horas_tecnico * valor_hora
+        custo_mensal = (
+            manutencao
+            + pecas
+            + seguro
+            + custo_tecnico
+            + deslocamento
+            + outros
+        )
+        custo_operacional = (
+            custo_mensal * prazo
+            + revisao_inicial
+        )
+        reserva_risco = (
+            custo_operacional * reserva_risco_pct / 100
+        )
+
+        if modelo_usado == "Somente custos incrementais":
+            investimento_recuperar = 0.0
+        elif modelo_usado == "Custos + depreciação do contrato":
+            depreciacao_no_contrato = min(
+                valor_ativo / (vida_util * 12) * prazo,
+                dep["valor_contabil"]
+                + min(
+                    valor_ativo / (vida_util * 12) * prazo,
+                    valor_ativo,
+                ),
+            )
+            investimento_recuperar = depreciacao_no_contrato
+        else:
+            investimento_recuperar = dep["valor_contabil"]
+
+        atual = calcular_resultado(
+            investimento_recuperar,
+            int(prazo),
+            aluguel,
+            custo_operacional,
+            IMPOSTO_ATUAL,
+            com_pct,
+            margem,
+            0.0,
+            reserva_risco,
+        )
+
+        base_credito = (
+            custo_operacional
+            + reserva_risco
+        )
+        demais_custos_reforma = (
+            investimento_recuperar
+            + custo_operacional
+            + reserva_risco
+            + atual["comissao"]
+        )
+        reforma = calcular_reforma(
+            atual["receita"],
+            base_credito,
+            cbs,
+            ibs,
+            credito_pct,
+            demais_custos_reforma,
+        )
+
+        st.markdown(
+            '<div class="section-title">Resumo executivo</div>',
+            unsafe_allow_html=True,
+        )
+        cards = [
+            (
+                "Aluguel mínimo",
+                moeda(atual["aluguel_minimo"]),
+                f"Margem {perc(margem)}",
+            ),
+            (
+                "Custo mensal operacional",
+                moeda(custo_mensal),
+                "Manutenção + técnico + outros",
+            ),
+            (
+                "Lucro atual",
+                moeda(atual["lucro"]),
+                "Com aluguel informado",
+            ),
+            (
+                "Payback",
+                meses(atual["payback"]),
+                modelo_usado,
+            ),
+        ]
+        cols = st.columns(4)
+        for c, item in zip(cols, cards):
+            with c:
+                card(*item)
+
+        st.markdown(
+            '<div class="section-title">Depreciação e ativo</div>',
+            unsafe_allow_html=True,
+        )
+        cards = [
+            (
+                "Meses já depreciados",
+                f"{dep['meses_antes']} meses",
+                "Antes do contrato",
+            ),
+            (
+                "Taxa de depreciação",
+                perc(dep["taxa"]),
+                f"{dep['meses_finais']} meses totais",
+            ),
+            (
+                "Valor contábil final",
+                moeda(dep["valor_contabil"]),
+                "Após o contrato",
+            ),
+            (
+                "Capital recuperado",
+                moeda(investimento_recuperar),
+                modelo_usado,
+            ),
+        ]
+        cols = st.columns(4)
+        for c, item in zip(cols, cards):
+            with c:
+                card(*item)
+
+        st.markdown(
+            '<div class="section-title">Atual x pós-reforma</div>',
+            unsafe_allow_html=True,
+        )
+        cards = [
+            (
+                "Impostos atuais",
+                moeda(atual["impostos"]),
+                "14,30%",
+            ),
+            (
+                "IBS/CBS bruto",
+                moeda(reforma["tributo_bruto"]),
+                perc(reforma["aliquota"]),
+            ),
+            (
+                "Crédito estimado",
+                moeda(reforma["credito"]),
+                perc(credito_pct),
+            ),
+            (
+                "Lucro pós-reforma",
+                moeda(reforma["lucro"]),
+                "Após créditos",
+            ),
+        ]
+        cols = st.columns(4)
+        for c, item in zip(cols, cards):
+            with c:
+                card(*item)
+
+        parecer = (
+            f"O modelo adotado foi '{modelo_usado}'. "
+            f"O equipamento terá {perc(dep['taxa'])} de depreciação acumulada "
+            f"ao final do contrato e valor contábil estimado de "
+            f"{moeda(dep['valor_contabil'])}. O custo operacional mensal "
+            f"estimado é {moeda(custo_mensal)}, acrescido de reserva técnica "
+            f"de {perc(reserva_risco_pct)}. O aluguel mínimo recomendado é "
+            f"{moeda(atual['aluguel_minimo'])}."
+        )
+        st.markdown(
+            '<div class="section-title">Parecer</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="parecer">{parecer}</div>',
+            unsafe_allow_html=True,
+        )
+
+        if st.button(
+            "Salvar precificação de usado",
+            use_container_width=True,
+        ):
+            salvar(
+                {
+                    "data_hora": datetime.now().strftime(
+                        "%d/%m/%Y %H:%M:%S"
+                    ),
+                    "tipo": "Usado",
+                    "cliente": cliente,
+                    "equipamento": equipamento,
+                    "fabricante": fabricante,
+                    "responsavel": responsavel,
+                    "prazo": int(prazo),
+                    "investimento": investimento_recuperar,
+                    "aluguel": aluguel,
+                    "receita": atual["receita"],
+                    "custos": atual["custo_total"],
+                    "impostos": atual["impostos"],
+                    "comissao": atual["comissao"],
+                    "lucro": atual["lucro"],
+                    "margem": atual["margem"],
+                    "payback": atual["payback"],
+                    "aluguel_minimo": atual["aluguel_minimo"],
+                    "depreciacao": dep["taxa"],
+                    "valor_contabil": dep["valor_contabil"],
+                    "lucro_reforma": reforma["lucro"],
+                    "origem": "Ativo próprio",
+                    "detalhes": json.dumps(
+                        {
+                            "modelo_usado": modelo_usado,
+                            "manutencao": manutencao,
+                            "pecas": pecas,
+                            "horas_tecnico": horas_tecnico,
+                            "valor_hora": valor_hora,
+                            "custo_tecnico": custo_tecnico,
+                            "reserva_risco_pct": reserva_risco_pct,
+                            "cbs": cbs,
+                            "ibs": ibs,
+                            "credito_pct": credito_pct,
+                            "data_aquisicao": data_aquisicao.strftime(
+                                "%d/%m/%Y"
+                            ),
+                            "data_inicio": data_inicio.strftime(
+                                "%d/%m/%Y"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+            st.success("Precificação salva.")
+
+# ======================================================
+# ATIVOS
+# ======================================================
+elif menu == "3 - Ativos":
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>Ativos</h1>
+            <p>Consulta da base pré-cadastrada.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    ativos = carregar_ativos()
+    if ativos.empty:
+        st.warning(
+            "Arquivo ativos_pre_cadastro.csv não encontrado ou vazio."
+        )
     else:
-        busca=st.text_input('Buscar'); v=a.copy()
-        if busca:v=v[v.astype(str).apply(lambda x:x.str.contains(busca,case=False,na=False)).any(axis=1)]
-        st.dataframe(v,use_container_width=True,hide_index=True)
+        busca = st.text_input("Buscar")
+        view = ativos.copy()
+        if busca:
+            view = view[
+                view.astype(str)
+                .apply(
+                    lambda x: x.str.contains(
+                        busca,
+                        case=False,
+                        na=False,
+                    )
+                )
+                .any(axis=1)
+            ]
+        st.dataframe(
+            view,
+            use_container_width=True,
+            hide_index=True,
+        )
 
-elif menu=='4 - Histórico':
-    st.markdown('<div class="hero"><h1>Histórico de Precificação</h1><p>Lista de novos e usados já precificados.</p></div>',unsafe_allow_html=True); h=hist()
-    if h.empty: st.info('Nenhuma precificação salva.')
+# ======================================================
+# HISTÓRICO
+# ======================================================
+elif menu == "4 - Histórico":
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>Histórico de Precificação</h1>
+            <p>Lista única de novos e usados já precificados.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    h = historico()
+    if h.empty:
+        st.info("Nenhuma precificação salva.")
     else:
-        c1,c2,c3=st.columns(3); tipos=c1.multiselect('Tipo',['Novo','Usado'],default=['Novo','Usado']); cli=c2.text_input('Cliente'); eq=c3.text_input('Equipamento'); v=h.copy()
-        if tipos:v=v[v.tipo.isin(tipos)]
-        if cli:v=v[v.cliente.str.contains(cli,case=False,na=False)]
-        if eq:v=v[v.equipamento.str.contains(eq,case=False,na=False)]
-        view=v[['id','data_hora','tipo','cliente','equipamento','fabricante','responsavel','prazo','investimento','aluguel','aluguel_minimo','lucro','margem','origem']].copy()
-        for c in ['investimento','aluguel','aluguel_minimo','lucro']:view[c]=view[c].map(moeda)
-        view['margem']=view.margem.map(perc); st.dataframe(view,use_container_width=True,hide_index=True)
-        st.download_button('Exportar histórico',data=v.to_csv(index=False).encode('utf-8-sig'),file_name='historico_precificacao.csv',mime='text/csv',use_container_width=True)
+        col1, col2, col3 = st.columns(3)
+        tipos = col1.multiselect(
+            "Tipo",
+            ["Novo", "Usado"],
+            default=["Novo", "Usado"],
+        )
+        cliente = col2.text_input("Cliente")
+        equipamento = col3.text_input("Equipamento")
 
-else:
-    st.markdown('<div class="hero"><h1>Parâmetros</h1><p>Premissas padrão usadas no app.</p></div>',unsafe_allow_html=True)
-    st.dataframe(pd.DataFrame([['Impostos sobre locação','14,30%'],['Nacionalização de novos','65,00% — editável'],['Dólar','PTAX de venda do Banco Central'],['Comissão vendedor','5,00%'],['Comissão gerente','0,50%'],['Comissão representante','14,00% — editável'],['Margem desejada','25,00%'],['Financiamento','Tabela Price; 1,60% a.m.'],['Usados','Manutenção + peças + horas técnicas + demais custos']],columns=['Parâmetro','Valor']),use_container_width=True,hide_index=True)
+        view = h.copy()
+        if tipos:
+            view = view[view["tipo"].isin(tipos)]
+        if cliente:
+            view = view[
+                view["cliente"].str.contains(
+                    cliente,
+                    case=False,
+                    na=False,
+                )
+            ]
+        if equipamento:
+            view = view[
+                view["equipamento"].str.contains(
+                    equipamento,
+                    case=False,
+                    na=False,
+                )
+            ]
+
+        cols = [
+            "id",
+            "data_hora",
+            "tipo",
+            "cliente",
+            "equipamento",
+            "fabricante",
+            "prazo",
+            "investimento",
+            "aluguel",
+            "aluguel_minimo",
+            "lucro",
+            "lucro_reforma",
+            "margem",
+            "payback",
+            "depreciacao",
+            "valor_contabil",
+            "origem",
+        ]
+
+        st.dataframe(
+            tabela_formatada(
+                view[cols],
+                money=[
+                    "investimento",
+                    "aluguel",
+                    "aluguel_minimo",
+                    "lucro",
+                    "lucro_reforma",
+                    "valor_contabil",
+                ],
+                percent=[
+                    "margem",
+                    "depreciacao",
+                ],
+                months=["payback"],
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "Exportar histórico",
+            data=view.to_csv(index=False).encode("utf-8-sig"),
+            file_name="historico_precificacao.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+# ======================================================
+# PARÂMETROS
+# ======================================================
+elif menu == "5 - Parâmetros":
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>Parâmetros</h1>
+            <p>Premissas usadas nas precificações.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    parametros = pd.DataFrame(
+        [
+            ["Impostos atuais", "14,30%"],
+            ["Nacionalização de novos", "65,00% editável"],
+            ["Dólar", "PTAX de venda do Banco Central"],
+            ["Comissão vendedor", "5,00%"],
+            ["Comissão gerente", "0,50%"],
+            ["Comissão representante", "14,00% editável"],
+            ["Margem desejada", "25,00%"],
+            ["Financiamento", "Tabela Price; 1,60% a.m."],
+            ["Vida útil padrão", "10 anos"],
+            ["CBS pós-reforma", "8,80% editável"],
+            ["IBS pós-reforma", "17,70% editável"],
+            ["Crédito pós-reforma", "100% da base elegível, editável"],
+            [
+                "Modelo de usados",
+                (
+                    "Custos operacionais + reserva técnica + "
+                    "recuperação de capital escolhida"
+                ),
+            ],
+        ],
+        columns=["Parâmetro", "Valor"],
+    )
+
+    st.dataframe(
+        parametros,
+        use_container_width=True,
+        hide_index=True,
+    )
