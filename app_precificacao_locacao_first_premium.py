@@ -20,6 +20,83 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ======================================================
+# PERSISTÊNCIA DOS PREENCHIMENTOS ENTRE ABAS
+# ======================================================
+# Mantém as chaves dos widgets vivas mesmo quando a respectiva aba/menu
+# deixa de ser renderizada temporariamente.
+for _state_key in list(st.session_state.keys()):
+    try:
+        st.session_state[_state_key] = st.session_state[_state_key]
+    except Exception:
+        pass
+
+
+def _slug_widget(texto):
+    texto = re.sub(r"[^a-zA-Z0-9_]+", "_", str(texto)).strip("_").lower()
+    return texto[:80] or "campo"
+
+
+def _persistent_key(label, explicit_key=None):
+    if explicit_key:
+        return explicit_key
+    prefixo = st.session_state.get("_active_menu", "global")
+    return f"draft__{_slug_widget(prefixo)}__{_slug_widget(label)}"
+
+
+# Wrappers para que widgets sem key explícita também tenham estado persistente.
+_original_text_input = st.text_input
+_original_number_input = st.number_input
+_original_date_input = st.date_input
+_original_radio = st.radio
+_original_selectbox = st.selectbox
+_original_checkbox = st.checkbox
+_original_multiselect = st.multiselect
+
+
+def _text_input(label, *args, **kwargs):
+    kwargs["key"] = _persistent_key(label, kwargs.get("key"))
+    return _original_text_input(label, *args, **kwargs)
+
+
+def _number_input(label, *args, **kwargs):
+    kwargs["key"] = _persistent_key(label, kwargs.get("key"))
+    return _original_number_input(label, *args, **kwargs)
+
+
+def _date_input(label, *args, **kwargs):
+    kwargs["key"] = _persistent_key(label, kwargs.get("key"))
+    return _original_date_input(label, *args, **kwargs)
+
+
+def _radio(label, *args, **kwargs):
+    kwargs["key"] = _persistent_key(label, kwargs.get("key"))
+    return _original_radio(label, *args, **kwargs)
+
+
+def _selectbox(label, *args, **kwargs):
+    kwargs["key"] = _persistent_key(label, kwargs.get("key"))
+    return _original_selectbox(label, *args, **kwargs)
+
+
+def _checkbox(label, *args, **kwargs):
+    kwargs["key"] = _persistent_key(label, kwargs.get("key"))
+    return _original_checkbox(label, *args, **kwargs)
+
+
+def _multiselect(label, *args, **kwargs):
+    kwargs["key"] = _persistent_key(label, kwargs.get("key"))
+    return _original_multiselect(label, *args, **kwargs)
+
+
+st.text_input = _text_input
+st.number_input = _number_input
+st.date_input = _date_input
+st.radio = _radio
+st.selectbox = _selectbox
+st.checkbox = _checkbox
+st.multiselect = _multiselect
+
 DB_PATH = "historico_precificacao.db"
 ATIVOS_CSV = "ativos_pre_cadastro.csv"
 
@@ -259,6 +336,101 @@ def calcular_depreciacao(valor, data_aquisicao, data_inicio, prazo, vida_anos):
     }
 
 
+def taxa_manutencao_por_depreciacao(depreciacao_atual_pct):
+    """Curva gerencial inicial de manutenção anual sobre o valor de aquisição.
+
+    Quanto mais depreciado/antigo o ativo, maior a reserva de manutenção.
+    As faixas são premissas iniciais e permanecem editáveis no formulário.
+    """
+    if depreciacao_atual_pct <= 20:
+        return 2.0
+    if depreciacao_atual_pct <= 40:
+        return 3.0
+    if depreciacao_atual_pct <= 60:
+        return 5.0
+    if depreciacao_atual_pct <= 80:
+        return 7.0
+    return 10.0
+
+
+def horas_tecnicas_por_depreciacao(depreciacao_atual_pct):
+    """Estimativa inicial de horas técnicas mensais."""
+    if depreciacao_atual_pct <= 20:
+        return 1.0
+    if depreciacao_atual_pct <= 40:
+        return 2.0
+    if depreciacao_atual_pct <= 60:
+        return 3.0
+    if depreciacao_atual_pct <= 80:
+        return 4.0
+    return 6.0
+
+
+def simulacao_base_usado(
+    valor_ativo,
+    data_aquisicao,
+    data_inicio,
+    prazo=24,
+    vida_util=10.0,
+    imposto_pct=IMPOSTO_ATUAL,
+    comissao_pct=COMISSAO_VENDEDOR + COMISSAO_GERENTE,
+    margem_pct=MARGEM_PADRAO,
+    reserva_risco_pct=5.0,
+):
+    """Gera uma referência de manutenção e aluguel para o ativo usado."""
+    dep_atual = calcular_depreciacao(
+        valor_ativo,
+        data_aquisicao,
+        data_inicio,
+        0,
+        vida_util,
+    )
+    dep_final = calcular_depreciacao(
+        valor_ativo,
+        data_aquisicao,
+        data_inicio,
+        prazo,
+        vida_util,
+    )
+
+    taxa_anual = taxa_manutencao_por_depreciacao(dep_atual["taxa"])
+    manutencao_mensal = valor_ativo * taxa_anual / 100 / 12
+
+    depreciacao_contrato = max(
+        dep_final["depreciacao"] - dep_atual["depreciacao"],
+        0.0,
+    )
+
+    custo_operacional = manutencao_mensal * prazo
+    reserva = custo_operacional * reserva_risco_pct / 100
+
+    denominador = (
+        1
+        - imposto_pct / 100
+        - comissao_pct / 100
+        - margem_pct / 100
+    )
+    aluguel_sugerido = (
+        (depreciacao_contrato + custo_operacional + reserva)
+        / prazo
+        / denominador
+        if prazo > 0 and denominador > 0
+        else 0.0
+    )
+
+    return {
+        "depreciacao_atual": dep_atual["taxa"],
+        "depreciacao_final": dep_final["taxa"],
+        "taxa_manutencao_anual": taxa_anual,
+        "manutencao_mensal": manutencao_mensal,
+        "horas_tecnicas": horas_tecnicas_por_depreciacao(
+            dep_atual["taxa"]
+        ),
+        "depreciacao_contrato": depreciacao_contrato,
+        "aluguel_sugerido": aluguel_sugerido,
+    }
+
+
 def calcular_resultado(
     investimento,
     prazo,
@@ -471,10 +643,20 @@ menu = st.sidebar.radio(
     ],
 )
 
+# Define o prefixo usado pelas chaves persistentes de cada aba.
+st.session_state["_active_menu"] = menu
+
 st.sidebar.markdown("---")
 st.sidebar.caption(
     "Atual | Pós-reforma | Novos | Usados"
 )
+
+if st.sidebar.button("Limpar rascunho da aba atual", use_container_width=True):
+    _prefix = f"draft__{_slug_widget(menu)}__"
+    for _key in list(st.session_state.keys()):
+        if str(_key).startswith(_prefix):
+            del st.session_state[_key]
+    st.rerun()
 
 # ======================================================
 # RESUMO EXECUTIVO
@@ -998,6 +1180,72 @@ elif menu == "2 - Locação de Usados":
                 f"Data: {info['data_aquisicao'] or 'não informada'}"
             )
 
+    # Gera valores-base quando um ativo é selecionado.
+    simulacao_inicial = None
+    if info and info.get("valor", 0) > 0:
+        data_base_aquisicao = (
+            info.get("data_aquisicao")
+            or date.today().strftime("%d/%m/%Y")
+        )
+        simulacao_inicial = simulacao_base_usado(
+            valor_ativo=info.get("valor", 0.0),
+            data_aquisicao=data_base_aquisicao,
+            data_inicio=date.today(),
+            prazo=24,
+            vida_util=VIDA_UTIL_PADRAO,
+        )
+
+        assinatura_ativo = (
+            f"{info.get('codigo', '')}|"
+            f"{info.get('valor', 0)}|"
+            f"{info.get('data_aquisicao', '')}"
+        )
+
+        if st.session_state.get("_ativo_usado_base") != assinatura_ativo:
+            st.session_state["_ativo_usado_base"] = assinatura_ativo
+            st.session_state["u_manut"] = moeda(
+                simulacao_inicial["manutencao_mensal"]
+            )
+            st.session_state["u_aluguel"] = moeda(
+                simulacao_inicial["aluguel_sugerido"]
+            )
+            st.session_state["u_horas_base"] = float(
+                simulacao_inicial["horas_tecnicas"]
+            )
+            st.session_state["u_taxa_manut_base"] = float(
+                simulacao_inicial["taxa_manutencao_anual"]
+            )
+
+        st.markdown(
+            '<div class="section-title">Simulação-base do ativo usado</div>',
+            unsafe_allow_html=True,
+        )
+        cols_base = st.columns(4)
+        with cols_base[0]:
+            card(
+                "Depreciação atual",
+                perc(simulacao_inicial["depreciacao_atual"]),
+                "Na data de início",
+            )
+        with cols_base[1]:
+            card(
+                "Reserva anual de manutenção",
+                perc(simulacao_inicial["taxa_manutencao_anual"]),
+                "Sobre o valor de aquisição",
+            )
+        with cols_base[2]:
+            card(
+                "Manutenção mensal-base",
+                moeda(simulacao_inicial["manutencao_mensal"]),
+                "Estimativa automática",
+            )
+        with cols_base[3]:
+            card(
+                "Aluguel-base sugerido",
+                moeda(simulacao_inicial["aluguel_sugerido"]),
+                "24 meses, margem de 25%",
+            )
+
     with st.form("usados"):
         col1, col2, col3 = st.columns(3)
         cliente = col1.text_input("Cliente")
@@ -1062,39 +1310,95 @@ elif menu == "2 - Locação de Usados":
             '<div class="section-title">Custo operacional</div>',
             unsafe_allow_html=True,
         )
+
+        dep_atual_form = calcular_depreciacao(
+            valor_ativo,
+            data_aquisicao,
+            data_inicio,
+            0,
+            vida_util,
+        )
+        taxa_manut_sugerida = taxa_manutencao_por_depreciacao(
+            dep_atual_form["taxa"]
+        )
+
         col1, col2, col3 = st.columns(3)
-        with col1:
-            manutencao = input_rs(
-                "Manutenção mensal",
-                0,
+        taxa_manutencao_anual = col1.number_input(
+            "Reserva anual de manutenção (% do valor de aquisição)",
+            min_value=0.0,
+            value=float(
+                st.session_state.get(
+                    "u_taxa_manut_base",
+                    taxa_manut_sugerida,
+                )
+            ),
+            step=0.5,
+            key="u_taxa_manutencao_anual",
+            help=(
+                "Faixa automática pela depreciação atual. "
+                "Pode ser alterada conforme a experiência da First."
+            ),
+        )
+        manutencao_calculada = (
+            valor_ativo * taxa_manutencao_anual / 100 / 12
+        )
+        usar_manutencao_automatica = col2.checkbox(
+            "Usar manutenção automática",
+            value=True,
+            key="u_usar_manut_auto",
+        )
+        with col3:
+            manutencao_manual = input_rs(
+                "Manutenção mensal manual",
+                manutencao_calculada,
                 "u_manut",
             )
-        with col2:
+
+        manutencao = (
+            manutencao_calculada
+            if usar_manutencao_automatica
+            else manutencao_manual
+        )
+        st.caption(
+            f"Manutenção considerada no cálculo: {moeda(manutencao)}"
+        )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
             pecas = input_rs(
                 "Peças / consumíveis mensais",
                 0,
                 "u_pecas",
             )
-        with col3:
+        with col2:
             seguro = input_rs(
                 "Seguro mensal",
                 0,
                 "u_seguro",
             )
-
-        col1, col2, col3 = st.columns(3)
-        horas_tecnico = col1.number_input(
+        horas_tecnico = col3.number_input(
             "Horas técnicas por mês",
             0.0,
+            value=float(
+                st.session_state.get(
+                    "u_horas_base",
+                    horas_tecnicas_por_depreciacao(
+                        dep_atual_form["taxa"]
+                    ),
+                )
+            ),
             step=1.0,
+            key="u_horas_tecnico",
         )
-        with col2:
+
+        col1, col2 = st.columns(2)
+        with col1:
             valor_hora = input_rs(
                 "Valor da hora técnica",
                 0,
                 "u_hora",
             )
-        with col3:
+        with col2:
             deslocamento = input_rs(
                 "Deslocamento mensal",
                 0,
@@ -1190,10 +1494,29 @@ elif menu == "2 - Locação de Usados":
             unsafe_allow_html=True,
         )
         col1, col2, col3 = st.columns(3)
+        simulacao_form = simulacao_base_usado(
+            valor_ativo=valor_ativo,
+            data_aquisicao=data_aquisicao,
+            data_inicio=data_inicio,
+            prazo=int(prazo),
+            vida_util=vida_util,
+            imposto_pct=IMPOSTO_ATUAL,
+            comissao_pct=com_pct,
+            margem_pct=MARGEM_PADRAO,
+            reserva_risco_pct=reserva_risco_pct,
+        )
+        aluguel_base_form = simulacao_form["aluguel_sugerido"]
+
+        if (
+            "u_aluguel" not in st.session_state
+            or parse(st.session_state.get("u_aluguel", 0)) == 0
+        ):
+            st.session_state["u_aluguel"] = moeda(aluguel_base_form)
+
         with col1:
             aluguel = input_rs(
-                "Aluguel mensal",
-                0,
+                "Aluguel mensal proposto",
+                aluguel_base_form,
                 "u_aluguel",
             )
         margem = col2.number_input(
@@ -1449,6 +1772,9 @@ elif menu == "2 - Locação de Usados":
                         {
                             "modelo_usado": modelo_usado,
                             "manutencao": manutencao,
+                            "manutencao_automatica": usar_manutencao_automatica,
+                            "taxa_manutencao_anual": taxa_manutencao_anual,
+                            "depreciacao_atual": dep_atual_form["taxa"],
                             "pecas": pecas,
                             "horas_tecnico": horas_tecnico,
                             "valor_hora": valor_hora,
@@ -1639,6 +1965,14 @@ elif menu == "5 - Parâmetros":
                     "Custos operacionais + reserva técnica + "
                     "recuperação de capital escolhida"
                 ),
+            ],
+            [
+                "Curva de manutenção dos usados",
+                "2%, 3%, 5%, 7% ou 10% ao ano conforme depreciação",
+            ],
+            [
+                "Horas técnicas sugeridas",
+                "1 a 6 horas/mês conforme depreciação atual",
             ],
         ],
         columns=["Parâmetro", "Valor"],
