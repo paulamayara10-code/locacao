@@ -3,6 +3,7 @@ import json
 import re
 import sqlite3
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import numpy as np
@@ -23,13 +24,9 @@ st.set_page_config(
 # ======================================================
 # PERSISTÊNCIA DOS PREENCHIMENTOS ENTRE ABAS
 # ======================================================
-# Mantém as chaves dos widgets vivas mesmo quando a respectiva aba/menu
-# deixa de ser renderizada temporariamente.
-for _state_key in list(st.session_state.keys()):
-    try:
-        st.session_state[_state_key] = st.session_state[_state_key]
-    except Exception:
-        pass
+# O Streamlit mantém os valores do session_state durante a sessão.
+# Não reatribuímos as chaves dos widgets, pois isso pode causar conflito
+# quando um formulário está sendo renderizado.
 
 
 def _slug_widget(texto):
@@ -55,7 +52,12 @@ _original_multiselect = st.multiselect
 
 
 def _text_input(label, *args, **kwargs):
-    kwargs["key"] = _persistent_key(label, kwargs.get("key"))
+    key = _persistent_key(label, kwargs.get("key"))
+    kwargs["key"] = key
+
+    if key in st.session_state:
+        kwargs.pop("value", None)
+
     return _original_text_input(label, *args, **kwargs)
 
 
@@ -532,10 +534,29 @@ def ptax():
         raise RuntimeError("sem cotação")
     reg = valores[0]
     dt = pd.to_datetime(reg["dataHoraCotacao"], errors="coerce")
-    return float(reg["cotacaoVenda"]), (
-        dt.strftime("%d/%m/%Y %H:%M")
-        if not pd.isna(dt)
-        else ""
+
+    if pd.isna(dt):
+        data_hora_brasilia = ""
+    else:
+        # A PTAX normalmente é retornada sem indicação explícita de fuso.
+        # Quando vier sem timezone, tratamos o horário como Brasília.
+        if getattr(dt, "tzinfo", None) is None:
+            dt_brasilia = dt.tz_localize("America/Sao_Paulo")
+        else:
+            dt_brasilia = dt.tz_convert("America/Sao_Paulo")
+
+        data_hora_brasilia = dt_brasilia.strftime(
+            "%d/%m/%Y %H:%M"
+        )
+
+    consulta_brasilia = datetime.now(
+        ZoneInfo("America/Sao_Paulo")
+    ).strftime("%d/%m/%Y %H:%M")
+
+    return (
+        float(reg["cotacaoVenda"]),
+        data_hora_brasilia,
+        consulta_brasilia,
     )
 
 # ======================================================
@@ -653,9 +674,36 @@ st.sidebar.caption(
 
 if st.sidebar.button("Limpar rascunho da aba atual", use_container_width=True):
     _prefix = f"draft__{_slug_widget(menu)}__"
+    _explicit_keys = {
+        "u_manut",
+        "u_aluguel",
+        "u_horas_tecnico",
+        "u_taxa_manutencao_anual",
+        "u_usar_manut_auto",
+        "u_pecas",
+        "u_seguro",
+        "u_hora",
+        "u_desloc",
+        "u_revisao",
+        "u_outros",
+        "ucbs",
+        "uibs",
+        "ucredito",
+        "ucv",
+        "ucg",
+        "ucr",
+        "comissao_usados",
+    }
+
     for _key in list(st.session_state.keys()):
-        if str(_key).startswith(_prefix):
+        if (
+            str(_key).startswith(_prefix)
+            or _key in _explicit_keys
+            or str(_key).startswith("_base_")
+            or _key == "_ativo_usado_base"
+        ):
             del st.session_state[_key]
+
     st.rerun()
 
 # ======================================================
@@ -774,9 +822,11 @@ elif menu == "1 - Locação de Novos":
     )
 
     try:
-        dolar_padrao, data_ptax = ptax()
+        dolar_padrao, data_ptax, consulta_brasilia = ptax()
         st.success(
-            f"PTAX de venda: R$ {dolar_padrao:.4f} em {data_ptax}"
+            f"PTAX de venda: R$ {dolar_padrao:.4f} | "
+            f"Cotação de {data_ptax} | "
+            f"Consulta em {consulta_brasilia} — horário de Brasília"
         )
     except Exception:
         dolar_padrao = 5.50
@@ -1201,18 +1251,20 @@ elif menu == "2 - Locação de Usados":
             f"{info.get('data_aquisicao', '')}"
         )
 
+        # Valores-base são usados como padrão dos campos.
+        # Não escrevemos diretamente nas chaves dos widgets dentro do formulário.
         if st.session_state.get("_ativo_usado_base") != assinatura_ativo:
             st.session_state["_ativo_usado_base"] = assinatura_ativo
-            st.session_state["u_manut"] = moeda(
+            st.session_state["_base_manutencao_usado"] = float(
                 simulacao_inicial["manutencao_mensal"]
             )
-            st.session_state["u_aluguel"] = moeda(
+            st.session_state["_base_aluguel_usado"] = float(
                 simulacao_inicial["aluguel_sugerido"]
             )
-            st.session_state["u_horas_base"] = float(
+            st.session_state["_base_horas_usado"] = float(
                 simulacao_inicial["horas_tecnicas"]
             )
-            st.session_state["u_taxa_manut_base"] = float(
+            st.session_state["_base_taxa_manut_usado"] = float(
                 simulacao_inicial["taxa_manutencao_anual"]
             )
 
@@ -1328,7 +1380,7 @@ elif menu == "2 - Locação de Usados":
             min_value=0.0,
             value=float(
                 st.session_state.get(
-                    "u_taxa_manut_base",
+                    "_base_taxa_manut_usado",
                     taxa_manut_sugerida,
                 )
             ),
@@ -1350,7 +1402,12 @@ elif menu == "2 - Locação de Usados":
         with col3:
             manutencao_manual = input_rs(
                 "Manutenção mensal manual",
-                manutencao_calculada,
+                float(
+                    st.session_state.get(
+                        "_base_manutencao_usado",
+                        manutencao_calculada,
+                    )
+                ),
                 "u_manut",
             )
 
@@ -1381,7 +1438,7 @@ elif menu == "2 - Locação de Usados":
             0.0,
             value=float(
                 st.session_state.get(
-                    "u_horas_base",
+                    "_base_horas_usado",
                     horas_tecnicas_por_depreciacao(
                         dep_atual_form["taxa"]
                     ),
@@ -1507,16 +1564,17 @@ elif menu == "2 - Locação de Usados":
         )
         aluguel_base_form = simulacao_form["aluguel_sugerido"]
 
-        if (
-            "u_aluguel" not in st.session_state
-            or parse(st.session_state.get("u_aluguel", 0)) == 0
-        ):
-            st.session_state["u_aluguel"] = moeda(aluguel_base_form)
+        aluguel_padrao = float(
+            st.session_state.get(
+                "_base_aluguel_usado",
+                aluguel_base_form,
+            )
+        )
 
         with col1:
             aluguel = input_rs(
                 "Aluguel mensal proposto",
-                aluguel_base_form,
+                aluguel_padrao,
                 "u_aluguel",
             )
         margem = col2.number_input(
