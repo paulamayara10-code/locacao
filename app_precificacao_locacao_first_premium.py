@@ -853,39 +853,74 @@ elif menu == "1 - Locação de Novos":
         )
 
         st.markdown(
-            '<div class="section-title">Importação e nacionalização</div>',
+            '<div class="section-title">Origem do equipamento</div>',
             unsafe_allow_html=True,
         )
-        col1, col2, col3 = st.columns(3)
-        fob = col1.number_input(
-            "Valor FOB (US$)",
-            0.0,
-            step=100.0,
-            format="%.2f",
-        )
-        dolar = col2.number_input(
-            "Dólar utilizado (R$)",
-            0.01,
-            value=float(dolar_padrao),
-            step=0.01,
-            format="%.4f",
-        )
-        nacionalizacao = col3.number_input(
-            "Nacionalização (%)",
-            0.0,
-            value=NACIONALIZACAO_PADRAO,
-            step=1.0,
+
+        origem_produto = st.radio(
+            "Tipo de aquisição",
+            ["Produto importado", "Produto nacional"],
+            horizontal=True,
+            key="novo_origem_produto",
         )
 
-        fob_reais = fob * dolar
-        custo_nac = fob_reais * nacionalizacao / 100
-        investimento = fob_reais + custo_nac
+        fob = 0.0
+        dolar = float(dolar_padrao)
+        nacionalizacao = 0.0
+        fob_reais = 0.0
+        custo_nac = 0.0
+        valor_nacional = 0.0
 
-        st.info(
-            f"FOB convertido: {moeda(fob_reais)} | "
-            f"Nacionalização: {moeda(custo_nac)} | "
-            f"Investimento: {moeda(investimento)}"
-        )
+        if origem_produto == "Produto importado":
+            st.markdown(
+                '<div class="section-title">Importação e nacionalização</div>',
+                unsafe_allow_html=True,
+            )
+            col1, col2, col3 = st.columns(3)
+            fob = col1.number_input(
+                "Valor FOB (US$)",
+                0.0,
+                step=100.0,
+                format="%.2f",
+            )
+            dolar = col2.number_input(
+                "Dólar utilizado (R$)",
+                0.01,
+                value=float(dolar_padrao),
+                step=0.01,
+                format="%.4f",
+            )
+            nacionalizacao = col3.number_input(
+                "Nacionalização (%)",
+                0.0,
+                value=NACIONALIZACAO_PADRAO,
+                step=1.0,
+            )
+
+            fob_reais = fob * dolar
+            custo_nac = fob_reais * nacionalizacao / 100
+            investimento = fob_reais + custo_nac
+
+            st.info(
+                f"FOB convertido: {moeda(fob_reais)} | "
+                f"Nacionalização: {moeda(custo_nac)} | "
+                f"Investimento: {moeda(investimento)}"
+            )
+        else:
+            st.markdown(
+                '<div class="section-title">Aquisição nacional</div>',
+                unsafe_allow_html=True,
+            )
+            valor_nacional = input_rs(
+                "Valor de aquisição em R$",
+                0.0,
+                "novo_valor_nacional",
+            )
+            investimento = valor_nacional
+
+            st.info(
+                f"Investimento nacional considerado: {moeda(investimento)}"
+            )
 
         st.markdown(
             '<div class="section-title">Origem do investimento</div>',
@@ -1075,7 +1110,11 @@ elif menu == "1 - Locação de Novos":
             (
                 "Investimento",
                 moeda(investimento),
-                "FOB + nacionalização",
+                (
+                    "FOB + nacionalização"
+                    if origem_produto == "Produto importado"
+                    else "Aquisição nacional"
+                ),
             ),
             (
                 "Aluguel mínimo",
@@ -1160,9 +1199,11 @@ elif menu == "1 - Locação de Novos":
                     "origem": origem,
                     "detalhes": json.dumps(
                         {
+                            "origem_produto": origem_produto,
                             "fob_usd": fob,
                             "dolar": dolar,
                             "nacionalizacao": nacionalizacao,
+                            "valor_nacional": valor_nacional,
                             "comissao_pct": com_pct,
                             "cbs": cbs,
                             "ibs": ibs,
@@ -2006,7 +2047,8 @@ elif menu == "5 - Parâmetros":
     parametros = pd.DataFrame(
         [
             ["Impostos atuais", "14,30%"],
-            ["Nacionalização de novos", "65,00% editável"],
+            ["Nacionalização de novos importados", "65,00% editável"],
+            ["Aquisição nacional", "Valor informado diretamente em R$"],
             ["Dólar", "PTAX de venda do Banco Central"],
             ["Comissão vendedor", "5,00%"],
             ["Comissão gerente", "0,50%"],
