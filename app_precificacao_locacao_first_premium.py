@@ -2,6 +2,7 @@
 import json
 import re
 import sqlite3
+import hashlib
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -118,6 +119,16 @@ st.multiselect = _multiselect
 DB_PATH = "historico_precificacao.db"
 ATIVOS_CSV = "ativos_pre_cadastro.csv"
 
+# Base histórica mantida no próprio repositório Git.
+# Nome recomendado: base_bi.xlsx na raiz do projeto.
+BASE_BI_GIT = "base_bi.xlsx"
+BASE_BI_GIT_ALTERNATIVAS = [
+    BASE_BI_GIT,
+    "BASE BI.xlsx",
+    "BASE_BI.xlsx",
+    "BASE BI(2).xlsx",
+]
+
 IMPOSTO_ATUAL = 14.30
 NACIONALIZACAO_PADRAO = 65.00
 COMISSAO_VENDEDOR = 5.00
@@ -204,6 +215,22 @@ def init_db():
             quantidade REAL, valor_unitario REAL, valor_mensal REAL, valor_total REAL,
             vendedor TEXT, gerente TEXT, sla TEXT, origem_contrato TEXT,
             nota_fiscal TEXT, observacao TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS arquivos_importados(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            caminho TEXT,
+            nome_arquivo TEXT,
+            hash_sha256 TEXT UNIQUE,
+            data_importacao TEXT,
+            fonte TEXT,
+            registros_inseridos INTEGER DEFAULT 0,
+            registros_ignorados INTEGER DEFAULT 0,
+            status TEXT,
+            mensagem TEXT
         )
         """
     )
@@ -345,6 +372,181 @@ def importar_base_bi(arquivo):
         if not cliente or not produto or (preco<=0 and total<=0): continue
         regs.append({'chave_unica':chave_historica('FATURAMENTO',nota,numero,produto,cliente,qtd,preco,total),'data_importacao':agora,'fonte':'BASE BI - Faturamento','tipo_referencia':'Locação faturada','identificador':numero,'data_referencia':data_excel_para_br(r.get(c['data'])) if c['data'] else '','cliente_codigo':texto_limpo(r.get(c['cod'])) if c['cod'] else '','cliente':cliente,'cnpj':'','equipamento_codigo':produto,'equipamento':desc or produto,'linha_produto':texto_limpo(r.get(c['linha'])) if c['linha'] else '','quantidade':qtd,'valor_unitario':preco,'valor_mensal':total,'valor_total':total,'vendedor':texto_limpo(r.get(c['resp'])) if c['resp'] else '','gerente':texto_limpo(r.get(c['gerente'])) if c['gerente'] else '','sla':'','origem_contrato':texto_limpo(r.get(c['fornecedor'])) if c['fornecedor'] else '','nota_fiscal':nota,'observacao':'Referência de faturamento de locação; valores preservados conforme a base.'})
     return salvar_referencias(regs)
+
+
+def localizar_base_bi_git():
+    """Localiza a BASE BI disponível no repositório."""
+    for nome in BASE_BI_GIT_ALTERNATIVAS:
+        caminho = Path(nome)
+        if caminho.exists() and caminho.is_file():
+            return caminho
+    return None
+
+
+def hash_sha256_arquivo(caminho):
+    digest = hashlib.sha256()
+    with open(caminho, "rb") as arquivo:
+        for bloco in iter(lambda: arquivo.read(1024 * 1024), b""):
+            digest.update(bloco)
+    return digest.hexdigest()
+
+
+def consultar_importacao_por_hash(hash_arquivo):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            """
+            SELECT id, caminho, nome_arquivo, data_importacao,
+                   registros_inseridos, registros_ignorados, status
+            FROM arquivos_importados
+            WHERE hash_sha256 = ?
+            LIMIT 1
+            """,
+            (hash_arquivo,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "id": row[0],
+        "caminho": row[1],
+        "nome_arquivo": row[2],
+        "data_importacao": row[3],
+        "inseridos": row[4],
+        "ignorados": row[5],
+        "status": row[6],
+    }
+
+
+def registrar_arquivo_importado(
+    caminho,
+    hash_arquivo,
+    resultado,
+    status="Importado",
+    mensagem="",
+):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO arquivos_importados(
+                caminho,
+                nome_arquivo,
+                hash_sha256,
+                data_importacao,
+                fonte,
+                registros_inseridos,
+                registros_ignorados,
+                status,
+                mensagem
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(caminho),
+                Path(caminho).name,
+                hash_arquivo,
+                datetime.now(
+                    ZoneInfo("America/Sao_Paulo")
+                ).strftime("%d/%m/%Y %H:%M:%S"),
+                "BASE BI no Git",
+                int(resultado.get("inseridos", 0)),
+                int(resultado.get("ignorados", 0)),
+                status,
+                mensagem,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def historico_importacoes_git():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT id, nome_arquivo, data_importacao, fonte,
+                   registros_inseridos, registros_ignorados,
+                   status, mensagem
+            FROM arquivos_importados
+            ORDER BY id DESC
+            """,
+            conn,
+        )
+    except Exception:
+        df = pd.DataFrame()
+    finally:
+        conn.close()
+    return df
+
+
+def sincronizar_base_bi_git():
+    """Importa a BASE BI do Git somente quando o conteúdo mudar.
+
+    Se o banco SQLite for recriado após um reinício, a base do Git será
+    importada novamente e reconstruirá o histórico de consulta.
+    """
+    caminho = localizar_base_bi_git()
+
+    if caminho is None:
+        return {
+            "status": "Ausente",
+            "mensagem": (
+                "Nenhum arquivo base_bi.xlsx foi encontrado "
+                "na raiz do repositório."
+            ),
+            "caminho": "",
+            "inseridos": 0,
+            "ignorados": 0,
+        }
+
+    hash_arquivo = hash_sha256_arquivo(caminho)
+    existente = consultar_importacao_por_hash(hash_arquivo)
+
+    if existente:
+        return {
+            "status": "Atualizada",
+            "mensagem": (
+                f"{caminho.name} já foi sincronizada em "
+                f"{existente['data_importacao']}."
+            ),
+            "caminho": str(caminho),
+            "inseridos": existente["inseridos"],
+            "ignorados": existente["ignorados"],
+        }
+
+    try:
+        resultado = importar_base_bi(caminho)
+        registrar_arquivo_importado(
+            caminho=caminho,
+            hash_arquivo=hash_arquivo,
+            resultado=resultado,
+            status="Importado",
+            mensagem="Sincronização automática concluída.",
+        )
+        return {
+            "status": "Importada",
+            "mensagem": (
+                f"{resultado['inseridos']} novos registros importados; "
+                f"{resultado['ignorados']} duplicados ignorados."
+            ),
+            "caminho": str(caminho),
+            "inseridos": resultado["inseridos"],
+            "ignorados": resultado["ignorados"],
+        }
+    except Exception as erro:
+        return {
+            "status": "Erro",
+            "mensagem": str(erro),
+            "caminho": str(caminho),
+            "inseridos": 0,
+            "ignorados": 0,
+        }
+
 
 def salvar_cotacao(registro):
     conn = sqlite3.connect(DB_PATH)
@@ -1206,6 +1408,11 @@ def gerar_proposta_pdf(
 
 
 # ======================================================
+# SINCRONIZAÇÃO AUTOMÁTICA DA BASE HISTÓRICA DO GIT
+# ======================================================
+status_base_bi_git = sincronizar_base_bi_git()
+
+# ======================================================
 # MENU
 # ======================================================
 st.sidebar.markdown("## FIRST MEDICAL")
@@ -1232,6 +1439,20 @@ st.sidebar.markdown("---")
 st.sidebar.caption(
     "Atual | Pós-reforma | Novos | Usados"
 )
+
+with st.sidebar.expander("Base histórica no Git", expanded=False):
+    if status_base_bi_git["status"] in {"Importada", "Atualizada"}:
+        st.success(status_base_bi_git["status"])
+    elif status_base_bi_git["status"] == "Ausente":
+        st.warning("Arquivo não localizado")
+    else:
+        st.error("Falha na sincronização")
+
+    st.caption(status_base_bi_git["mensagem"])
+    if status_base_bi_git.get("caminho"):
+        st.caption(
+            f"Arquivo: {Path(status_base_bi_git['caminho']).name}"
+        )
 
 if st.sidebar.button("Limpar rascunho da aba atual", use_container_width=True):
     _prefix = f"draft__{_slug_widget(menu)}__"
@@ -1382,25 +1603,46 @@ elif menu == "1 - Locação de Novos":
         unsafe_allow_html=True,
     )
 
+    st.markdown(
+        '<div class="section-title">Origem do equipamento</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Fora do formulário para que a tela mude imediatamente.
+    origem_produto = st.radio(
+        "Tipo de aquisição",
+        ["Produto importado", "Produto nacional"],
+        horizontal=True,
+        key="novo_origem_produto",
+    )
+
     data_ptax = ""
     consulta_brasilia = datetime.now(
         ZoneInfo("America/Sao_Paulo")
     ).strftime("%d/%m/%Y %H:%M")
     ptax_automatica = False
+    dolar_padrao = 0.0
 
-    try:
-        dolar_padrao, data_ptax, consulta_brasilia = ptax()
-        ptax_automatica = True
-        st.success(
-            f"PTAX de venda: R$ {dolar_padrao:.4f} | "
-            f"Cotação de {data_ptax} | "
-            f"Consulta em {consulta_brasilia} — horário de Brasília"
-        )
-    except Exception:
-        dolar_padrao = 5.50
-        st.warning(
-            "Não foi possível consultar a PTAX. "
-            "Informe a cotação manualmente."
+    if origem_produto == "Produto importado":
+        try:
+            dolar_padrao, data_ptax, consulta_brasilia = ptax()
+            ptax_automatica = True
+            st.success(
+                f"PTAX de venda: R$ {dolar_padrao:.4f} | "
+                f"Cotação de {data_ptax} | "
+                f"Consulta em {consulta_brasilia} — horário de Brasília"
+            )
+        except Exception:
+            dolar_padrao = 5.50
+            st.warning(
+                "Não foi possível consultar a PTAX. "
+                "Informe a cotação manualmente."
+            )
+    else:
+        st.info(
+            "Produto nacional: informe apenas o valor de aquisição "
+            "da mercadoria em reais. FOB, dólar e nacionalização "
+            "não serão considerados."
         )
 
     with st.form("novos"):
@@ -1418,18 +1660,6 @@ elif menu == "1 - Locação de Novos":
             "Início da locação",
             date.today(),
             format="DD/MM/YYYY",
-        )
-
-        st.markdown(
-            '<div class="section-title">Origem do equipamento</div>',
-            unsafe_allow_html=True,
-        )
-
-        origem_produto = st.radio(
-            "Tipo de aquisição",
-            ["Produto importado", "Produto nacional"],
-            horizontal=True,
-            key="novo_origem_produto",
         )
 
         fob = 0.0
@@ -1476,18 +1706,22 @@ elif menu == "1 - Locação de Novos":
             )
         else:
             st.markdown(
-                '<div class="section-title">Aquisição nacional</div>',
+                '<div class="section-title">Aquisição da mercadoria nacional</div>',
                 unsafe_allow_html=True,
             )
             valor_nacional = input_rs(
-                "Valor de aquisição em R$",
+                "Valor de aquisição da mercadoria (R$)",
                 0.0,
                 "novo_valor_nacional",
             )
             investimento = valor_nacional
 
+            st.caption(
+                "Para mercadoria nacional, este valor substitui integralmente "
+                "FOB, dólar e nacionalização."
+            )
             st.info(
-                f"Investimento nacional considerado: {moeda(investimento)}"
+                f"Valor de aquisição considerado: {moeda(investimento)}"
             )
 
         st.markdown(
@@ -2682,7 +2916,42 @@ elif menu == "4 - Histórico":
                     except Exception: st.error('Informe IDs válidos separados por vírgula.')
     with aba_imp:
         st.markdown('<div class="section-title">Importação do histórico real</div>',unsafe_allow_html=True)
-        st.info('O Controle de Contratos entra como valor mensal contratado. A BASE BI é filtrada para locação e entra como faturamento histórico. Duplicados são ignorados automaticamente.')
+        st.info(
+            "A BASE BI pode permanecer salva no Git com o nome "
+            "`base_bi.xlsx`. O app sincroniza automaticamente quando "
+            "o conteúdo do arquivo muda. O upload abaixo fica como "
+            "alternativa para importações pontuais."
+        )
+
+        if status_base_bi_git["status"] in {"Importada", "Atualizada"}:
+            st.success(
+                f"BASE BI do Git: {status_base_bi_git['mensagem']}"
+            )
+        elif status_base_bi_git["status"] == "Ausente":
+            st.warning(
+                "Inclua o arquivo `base_bi.xlsx` na raiz do repositório "
+                "para ativar a sincronização automática."
+            )
+        else:
+            st.error(
+                f"Erro ao ler a BASE BI do Git: "
+                f"{status_base_bi_git['mensagem']}"
+            )
+
+        log_git = historico_importacoes_git()
+        if not log_git.empty:
+            with st.expander("Histórico de sincronizações do Git"):
+                st.dataframe(
+                    log_git,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        st.caption(
+            "O Controle de Contratos entra como valor mensal contratado. "
+            "A BASE BI é filtrada para locação e entra como faturamento "
+            "histórico. Duplicados são ignorados automaticamente."
+        )
         c1,c2=st.columns(2)
         with c1:
             arq=st.file_uploader('Controle de Contratos',type=['xlsx','xlsm'],key='upload_contratos_hist')
