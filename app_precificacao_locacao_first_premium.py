@@ -11,6 +11,22 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    BaseDocTemplate,
+    Frame,
+    PageTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+)
+
 # ======================================================
 # CONFIGURAÇÃO
 # ======================================================
@@ -176,6 +192,39 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS referencias_historicas(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chave_unica TEXT UNIQUE,
+            data_importacao TEXT, fonte TEXT, tipo_referencia TEXT,
+            identificador TEXT, data_referencia TEXT,
+            cliente_codigo TEXT, cliente TEXT, cnpj TEXT,
+            equipamento_codigo TEXT, equipamento TEXT, linha_produto TEXT,
+            quantidade REAL, valor_unitario REAL, valor_mensal REAL, valor_total REAL,
+            vendedor TEXT, gerente TEXT, sla TEXT, origem_contrato TEXT,
+            nota_fiscal TEXT, observacao TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cotacoes_dolar(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data_hora_registro TEXT,
+            data_hora_cotacao TEXT,
+            data_hora_consulta_brasilia TEXT,
+            valor REAL,
+            fonte TEXT,
+            origem TEXT,
+            finalidade TEXT,
+            cliente TEXT,
+            equipamento TEXT,
+            observacao TEXT,
+            usada_em_precificacao INTEGER DEFAULT 0
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -203,6 +252,138 @@ def historico():
         df = pd.DataFrame()
     conn.close()
     return df
+
+
+
+def salvar_referencias(registros):
+    if not registros: return {"inseridos": 0, "ignorados": 0}
+    conn=sqlite3.connect(DB_PATH); inseridos=ignorados=0
+    for registro in registros:
+        try:
+            cols=", ".join(registro.keys()); marks=", ".join(["?"]*len(registro))
+            conn.execute(f"INSERT INTO referencias_historicas({cols}) VALUES({marks})",list(registro.values())); inseridos+=1
+        except sqlite3.IntegrityError: ignorados+=1
+    conn.commit(); conn.close(); return {"inseridos":inseridos,"ignorados":ignorados}
+
+def referencias_historicas():
+    conn=sqlite3.connect(DB_PATH)
+    try: df=pd.read_sql_query("SELECT * FROM referencias_historicas ORDER BY id DESC",conn)
+    except Exception: df=pd.DataFrame()
+    conn.close(); return df
+
+def excluir_referencias(ids):
+    if not ids: return
+    conn=sqlite3.connect(DB_PATH); placeholders=','.join(['?']*len(ids))
+    conn.execute(f"DELETE FROM referencias_historicas WHERE id IN ({placeholders})",[int(x) for x in ids]); conn.commit(); conn.close()
+
+def normalizar_texto_coluna(valor):
+    texto=str(valor or '').strip().upper()
+    mapa=str.maketrans('ÁÀÃÂÉÊÍÓÔÕÚÇ','AAAAEEIOOOUC')
+    return re.sub(r'\s+',' ',texto.translate(mapa))
+
+def localizar_coluna(df, possibilidades):
+    mapa={normalizar_texto_coluna(c):c for c in df.columns}
+    for p in possibilidades:
+        if normalizar_texto_coluna(p) in mapa: return mapa[normalizar_texto_coluna(p)]
+    return None
+
+def data_excel_para_br(valor):
+    if pd.isna(valor) or valor=='': return ''
+    if isinstance(valor,(int,float,np.integer,np.floating)):
+        try:return (pd.Timestamp('1899-12-30')+pd.to_timedelta(float(valor),unit='D')).strftime('%d/%m/%Y')
+        except Exception:pass
+    dt=pd.to_datetime(valor,errors='coerce',dayfirst=True)
+    return str(valor) if pd.isna(dt) else dt.strftime('%d/%m/%Y')
+
+def texto_limpo(valor): return '' if pd.isna(valor) else str(valor).strip()
+def numero_limpo(valor): return parse(valor)
+
+def chave_historica(*partes):
+    import hashlib
+    base='|'.join(normalizar_texto_coluna(p) for p in partes)
+    return hashlib.sha256(base.encode('utf-8')).hexdigest()
+
+def importar_controle_contratos(arquivo):
+    abas=pd.read_excel(arquivo,sheet_name=None,engine='openpyxl')
+    nome=next((n for n in abas if normalizar_texto_coluna(n)=='FIRST'),None)
+    if not nome: raise ValueError('A aba FIRST não foi encontrada.')
+    df=abas[nome].dropna(how='all').copy()
+    c={
+      'contrato':localizar_coluna(df,['Nº CT','N CT','CONTRATO']), 'origem':localizar_coluna(df,['ORIGEM']),
+      'cod':localizar_coluna(df,['COD. CLIENTE','COD CLIENTE']), 'cnpj':localizar_coluna(df,['CNPJ/CPF','CNPJ']),
+      'cliente':localizar_coluna(df,['RAZÃO SOCIAL','RAZAO SOCIAL']), 'inicio':localizar_coluna(df,['INICIO','INÍCIO']),
+      'sla':localizar_coluna(df,['SLA']), 'valor':localizar_coluna(df,['VALOR FATURAMENTO','VALOR']),
+      'vendedor':localizar_coluna(df,['VENDEDOR']), 'gerente':localizar_coluna(df,['GERENTE']),
+      'linha':localizar_coluna(df,['LINHA DE PRODUTO'])}
+    if not c['contrato'] or not c['cliente'] or not c['valor']: raise ValueError('Colunas obrigatórias não encontradas.')
+    agora=datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%d/%m/%Y %H:%M:%S'); regs=[]
+    for _,r in df.iterrows():
+        contrato=texto_limpo(r.get(c['contrato'])); cliente=texto_limpo(r.get(c['cliente'])); valor=numero_limpo(r.get(c['valor']))
+        if (not contrato and not cliente) or valor<=0: continue
+        linha=texto_limpo(r.get(c['linha'])) if c['linha'] else ''; cod=texto_limpo(r.get(c['cod'])) if c['cod'] else ''
+        regs.append({'chave_unica':chave_historica('CONTRATO',contrato,cod,cliente,valor),'data_importacao':agora,'fonte':'Controle de Contratos','tipo_referencia':'Contrato ativo','identificador':contrato,'data_referencia':data_excel_para_br(r.get(c['inicio'])) if c['inicio'] else '', 'cliente_codigo':cod,'cliente':cliente,'cnpj':texto_limpo(r.get(c['cnpj'])) if c['cnpj'] else '','equipamento_codigo':'','equipamento':linha,'linha_produto':linha,'quantidade':1.0,'valor_unitario':valor,'valor_mensal':valor,'valor_total':valor,'vendedor':texto_limpo(r.get(c['vendedor'])) if c['vendedor'] else '','gerente':texto_limpo(r.get(c['gerente'])) if c['gerente'] else '','sla':texto_limpo(r.get(c['sla'])) if c['sla'] else '','origem_contrato':texto_limpo(r.get(c['origem'])) if c['origem'] else '','nota_fiscal':'','observacao':'Valor mensal contratual importado; sem custos, margem ou payback.'})
+    return salvar_referencias(regs)
+
+def importar_base_bi(arquivo):
+    abas=pd.read_excel(arquivo,sheet_name=None,engine='openpyxl')
+    nome=next((n for n in abas if 'BANCO DE DADOS FATURAMENTO' in normalizar_texto_coluna(n)),None)
+    if not nome: raise ValueError('A aba BANCO DE DADOS FATURAMENTO não foi encontrada.')
+    df=abas[nome].dropna(how='all').copy()
+    c={k:localizar_coluna(df,v) for k,v in {
+      'categoria':['CATEGORIA'],'numero':['NUMERO','NÚMERO'],'data':['DT EMISSAO','DT EMISSÃO'],'cod':['CLIENTE'],'cliente':['NOME DO CLIENTE'],'resp':['VENDEDOR / REPRESENTANTE'],'produto':['PRODUTO'],'desc':['DESCRIÇÃO','DESCRICAO'],'qtd':['QUANTIDADE'],'preco':['PREÇO UNITÁRIO','PRECO UNITARIO'],'valor':['VALOR'],'bruto':['VALOR BRUTO'],'nf':['NOTA FISCAL'],'segmento':['SEGMENTO'],'gerente':['GERENTE'],'fornecedor':['FORNECEDOR'],'linha':['LINHA DE PRODUTO'],'nova':['NOVA']}.items()}
+    if not c['cliente'] or not c['produto']: raise ValueError('Colunas mínimas não encontradas na BASE BI.')
+    mask=pd.Series(False,index=df.index)
+    for col in [c['categoria'],c['nova'],c['segmento']]:
+        if col: mask |= df[col].fillna('').astype(str).map(normalizar_texto_coluna).str.contains(r'LOCA|ALUG',regex=True,na=False)
+    df=df[mask].copy(); agora=datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%d/%m/%Y %H:%M:%S'); regs=[]
+    for _,r in df.iterrows():
+        cliente=texto_limpo(r.get(c['cliente'])); produto=texto_limpo(r.get(c['produto'])); desc=texto_limpo(r.get(c['desc'])) if c['desc'] else ''
+        nota=texto_limpo(r.get(c['nf'])) if c['nf'] else ''; numero=texto_limpo(r.get(c['numero'])) if c['numero'] else ''
+        qtd=numero_limpo(r.get(c['qtd'])) if c['qtd'] else 0; preco=numero_limpo(r.get(c['preco'])) if c['preco'] else 0
+        total=numero_limpo(r.get(c['bruto'])) if c['bruto'] else 0
+        if total<=0 and c['valor']: total=numero_limpo(r.get(c['valor']))
+        if not cliente or not produto or (preco<=0 and total<=0): continue
+        regs.append({'chave_unica':chave_historica('FATURAMENTO',nota,numero,produto,cliente,qtd,preco,total),'data_importacao':agora,'fonte':'BASE BI - Faturamento','tipo_referencia':'Locação faturada','identificador':numero,'data_referencia':data_excel_para_br(r.get(c['data'])) if c['data'] else '','cliente_codigo':texto_limpo(r.get(c['cod'])) if c['cod'] else '','cliente':cliente,'cnpj':'','equipamento_codigo':produto,'equipamento':desc or produto,'linha_produto':texto_limpo(r.get(c['linha'])) if c['linha'] else '','quantidade':qtd,'valor_unitario':preco,'valor_mensal':total,'valor_total':total,'vendedor':texto_limpo(r.get(c['resp'])) if c['resp'] else '','gerente':texto_limpo(r.get(c['gerente'])) if c['gerente'] else '','sla':'','origem_contrato':texto_limpo(r.get(c['fornecedor'])) if c['fornecedor'] else '','nota_fiscal':nota,'observacao':'Referência de faturamento de locação; valores preservados conforme a base.'})
+    return salvar_referencias(regs)
+
+def salvar_cotacao(registro):
+    conn = sqlite3.connect(DB_PATH)
+    cols = ", ".join(registro.keys())
+    marks = ", ".join(["?"] * len(registro))
+    cur = conn.execute(
+        f"INSERT INTO cotacoes_dolar({cols}) VALUES({marks})",
+        list(registro.values()),
+    )
+    conn.commit()
+    cotacao_id = cur.lastrowid
+    conn.close()
+    return cotacao_id
+
+
+def historico_cotacoes():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(
+            "SELECT * FROM cotacoes_dolar ORDER BY id DESC",
+            conn,
+        )
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
+
+def excluir_cotacoes(ids):
+    if not ids:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    placeholders = ",".join(["?"] * len(ids))
+    conn.execute(
+        f"DELETE FROM cotacoes_dolar WHERE id IN ({placeholders})",
+        [int(x) for x in ids],
+    )
+    conn.commit()
+    conn.close()
 
 
 init_db()
@@ -298,12 +479,16 @@ def price(valor, taxa, prazo):
     return valor * (i * (1 + i) ** prazo) / ((1 + i) ** prazo - 1)
 
 
-def comissao_total(tipo, vendedor, gerente, representante):
-    if tipo == "Vendedor + gerente":
-        return vendedor + gerente
-    if tipo == "Representante":
-        return representante
-    return 0.0
+def comissao_total(vendedor, gerente, representante):
+    """Soma todas as comissões informadas.
+
+    Os três campos são independentes e podem ser usados simultaneamente.
+    """
+    return (
+        max(float(vendedor), 0.0)
+        + max(float(gerente), 0.0)
+        + max(float(representante), 0.0)
+    )
 
 
 def calcular_depreciacao(valor, data_aquisicao, data_inicio, prazo, vida_anos):
@@ -645,6 +830,381 @@ def label_ativo(row):
         f"{moeda(info['valor'])}"
     )
 
+
+# ======================================================
+# PROPOSTA EM PDF
+# ======================================================
+def texto_pdf(valor):
+    texto = str(valor or "")
+    return (
+        texto.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def gerar_proposta_pdf(
+    tipo,
+    cliente,
+    equipamento,
+    fabricante,
+    responsavel,
+    prazo,
+    aluguel,
+    investimento,
+    resultado_atual,
+    resultado_reforma,
+    comissao_pct,
+    origem_investimento,
+    detalhes=None,
+    observacoes="",
+    validade_dias=15,
+):
+    buffer = BytesIO()
+
+    largura, altura = A4
+    margem = 16 * mm
+
+    estilos = getSampleStyleSheet()
+    estilos.add(
+        ParagraphStyle(
+            name="FirstTitle",
+            parent=estilos["Title"],
+            fontName="Helvetica-Bold",
+            fontSize=18,
+            leading=22,
+            textColor=colors.HexColor("#0B2F4A"),
+            alignment=TA_LEFT,
+            spaceAfter=6,
+        )
+    )
+    estilos.add(
+        ParagraphStyle(
+            name="FirstSub",
+            parent=estilos["Normal"],
+            fontName="Helvetica",
+            fontSize=9,
+            leading=12,
+            textColor=colors.HexColor("#64748B"),
+            alignment=TA_LEFT,
+        )
+    )
+    estilos.add(
+        ParagraphStyle(
+            name="Section",
+            parent=estilos["Heading2"],
+            fontName="Helvetica-Bold",
+            fontSize=11,
+            leading=14,
+            textColor=colors.HexColor("#0B2F4A"),
+            spaceBefore=8,
+            spaceAfter=6,
+        )
+    )
+    estilos.add(
+        ParagraphStyle(
+            name="BodySmall",
+            parent=estilos["Normal"],
+            fontName="Helvetica",
+            fontSize=8.5,
+            leading=11,
+            textColor=colors.HexColor("#243447"),
+        )
+    )
+    estilos.add(
+        ParagraphStyle(
+            name="Footer",
+            parent=estilos["Normal"],
+            fontName="Helvetica",
+            fontSize=7.5,
+            textColor=colors.HexColor("#64748B"),
+            alignment=TA_CENTER,
+        )
+    )
+
+    def cabecalho_rodape(canvas, doc):
+        canvas.saveState()
+
+        # Faixa superior
+        canvas.setFillColor(colors.HexColor("#0B2F4A"))
+        canvas.rect(0, altura - 18 * mm, largura, 18 * mm, fill=1, stroke=0)
+
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Helvetica-Bold", 13)
+        canvas.drawString(margem, altura - 11 * mm, "FIRST MEDICAL")
+
+        canvas.setFont("Helvetica", 8)
+        canvas.drawRightString(
+            largura - margem,
+            altura - 11 * mm,
+            "Proposta de Locação",
+        )
+
+        # Rodapé
+        canvas.setStrokeColor(colors.HexColor("#D9E3EC"))
+        canvas.line(
+            margem,
+            13 * mm,
+            largura - margem,
+            13 * mm,
+        )
+
+        canvas.setFillColor(colors.HexColor("#64748B"))
+        canvas.setFont("Helvetica", 7)
+        canvas.drawCentredString(
+            largura / 2,
+            8 * mm,
+            f"Documento gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')} - Página {doc.page}",
+        )
+        canvas.restoreState()
+
+    frame = Frame(
+        margem,
+        18 * mm,
+        largura - 2 * margem,
+        altura - 42 * mm,
+        id="normal",
+    )
+    template = PageTemplate(
+        id="First",
+        frames=[frame],
+        onPage=cabecalho_rodape,
+    )
+    doc = BaseDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=margem,
+        leftMargin=margem,
+        topMargin=24 * mm,
+        bottomMargin=18 * mm,
+        pageTemplates=[template],
+    )
+
+    story = []
+
+    validade = date.today() + timedelta(days=int(validade_dias))
+
+    story.append(
+        Paragraph(
+            f"Proposta de Locação - Equipamento {texto_pdf(tipo)}",
+            estilos["FirstTitle"],
+        )
+    )
+    story.append(
+        Paragraph(
+            f"Validade da proposta: {validade.strftime('%d/%m/%Y')}",
+            estilos["FirstSub"],
+        )
+    )
+    story.append(Spacer(1, 7 * mm))
+
+    story.append(Paragraph("Dados da proposta", estilos["Section"]))
+
+    dados = [
+        ["Cliente", texto_pdf(cliente or "Não informado")],
+        ["Equipamento", texto_pdf(equipamento or "Não informado")],
+        ["Fabricante / linha", texto_pdf(fabricante or "Não informado")],
+        ["Responsável comercial", texto_pdf(responsavel or "Não informado")],
+        ["Prazo da locação", f"{int(prazo)} meses"],
+        ["Origem do investimento", texto_pdf(origem_investimento)],
+    ]
+
+    tabela_dados = Table(
+        dados,
+        colWidths=[48 * mm, 127 * mm],
+        repeatRows=0,
+    )
+    tabela_dados.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EEF3F8")),
+                ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#0B2F4A")),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9E3EC")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    story.append(tabela_dados)
+    story.append(Spacer(1, 5 * mm))
+
+    story.append(Paragraph("Condições comerciais", estilos["Section"]))
+
+    condicoes = [
+        ["Aluguel mensal proposto", moeda(aluguel)],
+        ["Investimento considerado", moeda(investimento)],
+        ["Receita total estimada", moeda(resultado_atual["receita"])],
+        ["Impostos atuais", moeda(resultado_atual["impostos"])],
+        ["Comissões consideradas", f"{perc(comissao_pct)} - {moeda(resultado_atual['comissao'])}"],
+        ["Lucro estimado", moeda(resultado_atual["lucro"])],
+        ["Margem estimada", perc(resultado_atual["margem"])],
+        ["Payback estimado", meses(resultado_atual["payback"])],
+        ["Aluguel mínimo calculado", moeda(resultado_atual["aluguel_minimo"])],
+    ]
+
+    tabela_condicoes = Table(
+        condicoes,
+        colWidths=[75 * mm, 100 * mm],
+    )
+    tabela_condicoes.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F6F9FC")),
+                ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#0B2F4A")),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9E3EC")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    story.append(tabela_condicoes)
+    story.append(Spacer(1, 5 * mm))
+
+    if resultado_reforma:
+        story.append(
+            Paragraph(
+                "Simulação pós-reforma tributária",
+                estilos["Section"],
+            )
+        )
+
+        reforma = [
+            ["IBS/CBS bruto estimado", moeda(resultado_reforma["tributo_bruto"])],
+            ["Crédito estimado", moeda(resultado_reforma["credito"])],
+            ["IBS/CBS líquido", moeda(resultado_reforma["tributo_liquido"])],
+            ["Lucro estimado pós-reforma", moeda(resultado_reforma["lucro"])],
+        ]
+
+        tabela_reforma = Table(
+            reforma,
+            colWidths=[75 * mm, 100 * mm],
+        )
+        tabela_reforma.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EFFAF6")),
+                    ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#115E59")),
+                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                    ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+                    ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#CFE8DE")),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ]
+            )
+        )
+        story.append(tabela_reforma)
+        story.append(Spacer(1, 5 * mm))
+
+    if detalhes:
+        story.append(Paragraph("Premissas da operação", estilos["Section"]))
+
+        linhas_detalhes = []
+        for chave, valor in detalhes.items():
+            rotulo = (
+                str(chave)
+                .replace("_", " ")
+                .strip()
+                .capitalize()
+            )
+            if isinstance(valor, float):
+                valor_texto = (
+                    moeda(valor)
+                    if any(
+                        termo in chave
+                        for termo in [
+                            "valor",
+                            "custo",
+                            "fob",
+                            "investimento",
+                            "manutencao",
+                            "pecas",
+                            "seguro",
+                            "parcela",
+                            "hora",
+                            "aluguel",
+                        ]
+                    )
+                    else f"{valor:.2f}"
+                )
+            else:
+                valor_texto = str(valor)
+            linhas_detalhes.append(
+                [texto_pdf(rotulo), texto_pdf(valor_texto)]
+            )
+
+        if linhas_detalhes:
+            tabela_detalhes = Table(
+                linhas_detalhes,
+                colWidths=[75 * mm, 100 * mm],
+            )
+            tabela_detalhes.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#FAFAFA")),
+                        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                        ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
+                        ("FONTSIZE", (0, 0), (-1, -1), 7.8),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#E5E7EB")),
+                        ("TOPPADDING", (0, 0), (-1, -1), 5),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                    ]
+                )
+            )
+            story.append(tabela_detalhes)
+            story.append(Spacer(1, 5 * mm))
+
+    story.append(Paragraph("Observações", estilos["Section"]))
+    texto_obs = observacoes.strip() if observacoes else (
+        "Valores sujeitos à validação comercial, técnica, tributária e "
+        "disponibilidade do equipamento. Reajustes, fretes, instalações, "
+        "treinamentos, peças, consumíveis e demais condições deverão seguir "
+        "o contrato definitivo."
+    )
+    story.append(
+        Paragraph(
+            texto_pdf(texto_obs),
+            estilos["BodySmall"],
+        )
+    )
+    story.append(Spacer(1, 10 * mm))
+
+    assinaturas = Table(
+        [
+            ["", ""],
+            ["FIRST MEDICAL", texto_pdf(cliente or "CLIENTE")],
+            ["Responsável comercial", "Aceite do cliente"],
+        ],
+        colWidths=[82 * mm, 82 * mm],
+    )
+    assinaturas.setStyle(
+        TableStyle(
+            [
+                ("LINEABOVE", (0, 1), (0, 1), 0.6, colors.HexColor("#64748B")),
+                ("LINEABOVE", (1, 1), (1, 1), 0.6, colors.HexColor("#64748B")),
+                ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+                ("FONTNAME", (0, 2), (-1, 2), "Helvetica"),
+                ("FONTSIZE", (0, 1), (-1, 2), 8),
+                ("ALIGN", (0, 1), (-1, -1), "CENTER"),
+                ("TOPPADDING", (0, 1), (-1, -1), 4),
+            ]
+        )
+    )
+    story.append(assinaturas)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 # ======================================================
 # MENU
 # ======================================================
@@ -660,7 +1220,8 @@ menu = st.sidebar.radio(
         "2 - Locação de Usados",
         "3 - Ativos",
         "4 - Histórico",
-        "5 - Parâmetros",
+        "5 - Histórico de Cotações",
+        "6 - Parâmetros",
     ],
 )
 
@@ -821,8 +1382,15 @@ elif menu == "1 - Locação de Novos":
         unsafe_allow_html=True,
     )
 
+    data_ptax = ""
+    consulta_brasilia = datetime.now(
+        ZoneInfo("America/Sao_Paulo")
+    ).strftime("%d/%m/%Y %H:%M")
+    ptax_automatica = False
+
     try:
         dolar_padrao, data_ptax, consulta_brasilia = ptax()
+        ptax_automatica = True
         st.success(
             f"PTAX de venda: R$ {dolar_padrao:.4f} | "
             f"Cotação de {data_ptax} | "
@@ -981,46 +1549,37 @@ elif menu == "1 - Locação de Novos":
             )
 
         st.markdown(
-            '<div class="section-title">Comissão</div>',
+            '<div class="section-title">Comissões</div>',
             unsafe_allow_html=True,
         )
-        tipo_comissao = st.radio(
-            "Modelo",
-            [
-                "Vendedor + gerente",
-                "Representante",
-                "Sem comissão",
-            ],
-            horizontal=True,
+        st.caption(
+            "Os campos são independentes e podem ser usados simultaneamente. "
+            "Mantenha em 0,00% quando a comissão não se aplicar."
         )
         col1, col2, col3 = st.columns(3)
         cv = col1.number_input(
             "Vendedor (%)",
-            0.0,
+            min_value=0.0,
             value=COMISSAO_VENDEDOR,
             step=0.25,
-            disabled=tipo_comissao != "Vendedor + gerente",
+            key="novo_comissao_vendedor",
         )
         cg = col2.number_input(
             "Gerente (%)",
-            0.0,
+            min_value=0.0,
             value=COMISSAO_GERENTE,
             step=0.25,
-            disabled=tipo_comissao != "Vendedor + gerente",
+            key="novo_comissao_gerente",
         )
         cr = col3.number_input(
             "Representante (%)",
-            0.0,
-            value=COMISSAO_REPRESENTANTE,
-            step=0.5,
-            disabled=tipo_comissao != "Representante",
+            min_value=0.0,
+            value=0.0,
+            step=0.50,
+            key="novo_comissao_representante",
         )
-        com_pct = comissao_total(
-            tipo_comissao,
-            cv,
-            cg,
-            cr,
-        )
+        com_pct = comissao_total(cv, cg, cr)
+        st.info(f"Comissão total considerada: {perc(com_pct)}")
 
         st.markdown(
             '<div class="section-title">Receita e cenário pós-reforma</div>',
@@ -1067,6 +1626,34 @@ elif menu == "1 - Locação de Novos":
             "Impostos atuais (%)",
             value=IMPOSTO_ATUAL,
             disabled=True,
+        )
+
+        col1, col2 = st.columns(2)
+        validade_proposta = col1.number_input(
+            "Validade da proposta (dias)",
+            min_value=1,
+            value=15,
+            step=1,
+            key="novo_validade_proposta",
+        )
+        observacoes_proposta = col2.text_area(
+            "Observações da proposta",
+            height=90,
+            key="novo_observacoes_proposta",
+        )
+
+        col1, col2 = st.columns(2)
+        validade_proposta_usado = col1.number_input(
+            "Validade da proposta (dias)",
+            min_value=1,
+            value=15,
+            step=1,
+            key="usado_validade_proposta",
+        )
+        observacoes_proposta_usado = col2.text_area(
+            "Observações da proposta",
+            height=90,
+            key="usado_observacoes_proposta",
         )
 
         ok = st.form_submit_button(
@@ -1168,10 +1755,83 @@ elif menu == "1 - Locação de Novos":
             with c:
                 card(*item)
 
-        if st.button(
-            "Salvar precificação de novo",
-            use_container_width=True,
-        ):
+        detalhes_proposta_novo = {
+            "tipo_aquisicao": origem_produto,
+            "valor_fob_usd": fob,
+            "dolar_utilizado": dolar,
+            "nacionalizacao_pct": nacionalizacao,
+            "valor_nacional": valor_nacional,
+            "despesas_adicionais": despesas,
+            "comissao_vendedor_pct": cv,
+            "comissao_gerente_pct": cg,
+            "comissao_representante_pct": cr,
+            "taxa_financiamento_pct": taxa_fin if origem == "Financiamento bancário" else 0.0,
+            "prazo_financiamento_meses": prazo_fin if origem == "Financiamento bancário" else 0,
+            "parcela_financiamento": parcela,
+        }
+
+        proposta_pdf_novo = gerar_proposta_pdf(
+            tipo="Novo",
+            cliente=cliente,
+            equipamento=equipamento,
+            fabricante=fabricante,
+            responsavel=responsavel,
+            prazo=prazo,
+            aluguel=aluguel,
+            investimento=investimento,
+            resultado_atual=atual,
+            resultado_reforma=reforma,
+            comissao_pct=com_pct,
+            origem_investimento=origem,
+            detalhes=detalhes_proposta_novo,
+            observacoes=observacoes_proposta,
+            validade_dias=validade_proposta,
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "Baixar proposta em PDF",
+                data=proposta_pdf_novo,
+                file_name=(
+                    f"proposta_locacao_novo_"
+                    f"{_slug_widget(cliente or equipamento or 'cliente')}.pdf"
+                ),
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
+        with col2:
+            salvar_novo = st.button(
+                "Salvar precificação de novo",
+                use_container_width=True,
+            )
+
+        if salvar_novo:
+            cotacao_id = None
+            if origem_produto == "Produto importado":
+                cotacao_id = salvar_cotacao(
+                    {
+                        "data_hora_registro": datetime.now(
+                            ZoneInfo("America/Sao_Paulo")
+                        ).strftime("%d/%m/%Y %H:%M:%S"),
+                        "data_hora_cotacao": data_ptax or data_inicio.strftime("%d/%m/%Y"),
+                        "data_hora_consulta_brasilia": consulta_brasilia,
+                        "valor": dolar,
+                        "fonte": (
+                            "PTAX de venda - Banco Central do Brasil"
+                            if ptax_automatica
+                            else "Informada manualmente"
+                        ),
+                        "origem": "Automática" if ptax_automatica else "Manual",
+                        "finalidade": "Precificação de equipamento novo",
+                        "cliente": cliente,
+                        "equipamento": equipamento,
+                        "observacao": observacoes_proposta,
+                        "usada_em_precificacao": 1,
+                    }
+                )
+
             salvar(
                 {
                     "data_hora": datetime.now().strftime(
@@ -1202,8 +1862,15 @@ elif menu == "1 - Locação de Novos":
                             "origem_produto": origem_produto,
                             "fob_usd": fob,
                             "dolar": dolar,
+                            "cotacao_id": cotacao_id,
                             "nacionalizacao": nacionalizacao,
                             "valor_nacional": valor_nacional,
+                            "comissao_vendedor_pct": cv,
+                            "comissao_gerente_pct": cg,
+                            "comissao_representante_pct": cr,
+                            "comissao_vendedor_pct": cv,
+                            "comissao_gerente_pct": cg,
+                            "comissao_representante_pct": cr,
                             "comissao_pct": com_pct,
                             "cbs": cbs,
                             "ibs": ibs,
@@ -1542,50 +2209,37 @@ elif menu == "2 - Locação de Usados":
         )
 
         st.markdown(
-            '<div class="section-title">Comissão</div>',
+            '<div class="section-title">Comissões</div>',
             unsafe_allow_html=True,
         )
-        tipo_comissao = st.radio(
-            "Modelo",
-            [
-                "Vendedor + gerente",
-                "Representante",
-                "Sem comissão",
-            ],
-            horizontal=True,
-            key="comissao_usados",
+        st.caption(
+            "Os campos são independentes e podem ser usados simultaneamente. "
+            "Mantenha em 0,00% quando a comissão não se aplicar."
         )
         col1, col2, col3 = st.columns(3)
         cv = col1.number_input(
             "Vendedor (%)",
-            0.0,
+            min_value=0.0,
             value=COMISSAO_VENDEDOR,
             step=0.25,
-            disabled=tipo_comissao != "Vendedor + gerente",
             key="ucv",
         )
         cg = col2.number_input(
             "Gerente (%)",
-            0.0,
+            min_value=0.0,
             value=COMISSAO_GERENTE,
             step=0.25,
-            disabled=tipo_comissao != "Vendedor + gerente",
             key="ucg",
         )
         cr = col3.number_input(
             "Representante (%)",
-            0.0,
-            value=COMISSAO_REPRESENTANTE,
-            step=0.5,
-            disabled=tipo_comissao != "Representante",
+            min_value=0.0,
+            value=0.0,
+            step=0.50,
             key="ucr",
         )
-        com_pct = comissao_total(
-            tipo_comissao,
-            cv,
-            cg,
-            cr,
-        )
+        com_pct = comissao_total(cv, cg, cr)
+        st.info(f"Comissão total considerada: {perc(com_pct)}")
 
         st.markdown(
             '<div class="section-title">Receita e pós-reforma</div>',
@@ -1838,10 +2492,62 @@ elif menu == "2 - Locação de Usados":
             unsafe_allow_html=True,
         )
 
-        if st.button(
-            "Salvar precificação de usado",
-            use_container_width=True,
-        ):
+        detalhes_proposta_usado = {
+            "modelo_precificacao": modelo_usado,
+            "data_aquisicao": data_aquisicao.strftime("%d/%m/%Y"),
+            "depreciacao_atual_pct": dep_atual_form["taxa"],
+            "depreciacao_final_pct": dep["taxa"],
+            "valor_contabil_final": dep["valor_contabil"],
+            "manutencao_mensal": manutencao,
+            "pecas_mensais": pecas,
+            "seguro_mensal": seguro,
+            "horas_tecnicas_mes": horas_tecnico,
+            "valor_hora_tecnica": valor_hora,
+            "deslocamento_mensal": deslocamento,
+            "reserva_risco_pct": reserva_risco_pct,
+            "comissao_vendedor_pct": cv,
+            "comissao_gerente_pct": cg,
+            "comissao_representante_pct": cr,
+        }
+
+        proposta_pdf_usado = gerar_proposta_pdf(
+            tipo="Usado",
+            cliente=cliente,
+            equipamento=equipamento,
+            fabricante=fabricante,
+            responsavel=responsavel,
+            prazo=prazo,
+            aluguel=aluguel,
+            investimento=investimento_recuperar,
+            resultado_atual=atual,
+            resultado_reforma=reforma,
+            comissao_pct=com_pct,
+            origem_investimento="Ativo próprio",
+            detalhes=detalhes_proposta_usado,
+            observacoes=observacoes_proposta_usado,
+            validade_dias=validade_proposta_usado,
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "Baixar proposta em PDF",
+                data=proposta_pdf_usado,
+                file_name=(
+                    f"proposta_locacao_usado_"
+                    f"{_slug_widget(cliente or equipamento or 'cliente')}.pdf"
+                ),
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
+        with col2:
+            salvar_usado = st.button(
+                "Salvar precificação de usado",
+                use_container_width=True,
+            )
+
+        if salvar_usado:
             salvar(
                 {
                     "data_hora": datetime.now().strftime(
@@ -1938,102 +2644,211 @@ elif menu == "3 - Ativos":
 # HISTÓRICO
 # ======================================================
 elif menu == "4 - Histórico":
+    st.markdown("""<div class="hero"><h1>Histórico de Precificação</h1><p>Simulações do app e referências reais importadas das bases.</p></div>""",unsafe_allow_html=True)
+    aba_sim,aba_ref,aba_imp=st.tabs(["Simulações do app","Referências históricas","Importar bases"])
+    with aba_sim:
+        h=historico()
+        if h.empty: st.info("Nenhuma precificação criada no app.")
+        else:
+            c1,c2,c3=st.columns(3); tipos=c1.multiselect("Tipo",["Novo","Usado"],default=["Novo","Usado"],key="hist_tipo_sim"); cli=c2.text_input("Cliente",key="hist_cliente_sim"); eq=c3.text_input("Equipamento",key="hist_equip_sim")
+            view=h.copy()
+            if tipos:view=view[view["tipo"].isin(tipos)]
+            if cli:view=view[view["cliente"].str.contains(cli,case=False,na=False)]
+            if eq:view=view[view["equipamento"].str.contains(eq,case=False,na=False)]
+            cols=["id","data_hora","tipo","cliente","equipamento","fabricante","prazo","investimento","aluguel","aluguel_minimo","lucro","lucro_reforma","margem","payback","depreciacao","valor_contabil","origem"]
+            st.dataframe(tabela_formatada(view[cols],money=["investimento","aluguel","aluguel_minimo","lucro","lucro_reforma","valor_contabil"],percent=["margem","depreciacao"],months=["payback"]),use_container_width=True,hide_index=True)
+            st.download_button("Exportar simulações",view.to_csv(index=False).encode("utf-8-sig"),"historico_simulacoes.csv","text/csv",use_container_width=True)
+    with aba_ref:
+        refs=referencias_historicas()
+        if refs.empty: st.info("Nenhuma referência importada. Use a aba Importar bases.")
+        else:
+            c1,c2,c3,c4=st.columns(4); fontes=c1.multiselect("Fonte",sorted(refs['fonte'].dropna().unique()),default=sorted(refs['fonte'].dropna().unique()),key='ref_fontes'); cli=c2.text_input('Cliente contém',key='ref_cliente'); eq=c3.text_input('Equipamento contém',key='ref_equipamento'); ger=c4.text_input('Gerente contém',key='ref_gerente')
+            view=refs.copy()
+            if fontes:view=view[view['fonte'].isin(fontes)]
+            if cli:view=view[view['cliente'].str.contains(cli,case=False,na=False)]
+            if eq:view=view[view['equipamento'].str.contains(eq,case=False,na=False)]
+            if ger:view=view[view['gerente'].str.contains(ger,case=False,na=False)]
+            cards=[('Referências',len(view),'Registros filtrados'),('Valor mensal médio',moeda(view['valor_mensal'].mean()),'Contratos e faturamentos'),('Menor referência',moeda(view['valor_mensal'].min()),'Base filtrada'),('Maior referência',moeda(view['valor_mensal'].max()),'Base filtrada')]
+            for col,item in zip(st.columns(4),cards):
+                with col: card(*item)
+            cols=['id','fonte','tipo_referencia','identificador','data_referencia','cliente_codigo','cliente','cnpj','equipamento_codigo','equipamento','linha_produto','quantidade','valor_unitario','valor_mensal','valor_total','vendedor','gerente','sla','origem_contrato','nota_fiscal']
+            st.dataframe(tabela_formatada(view[cols],money=['valor_unitario','valor_mensal','valor_total']),use_container_width=True,hide_index=True)
+            c1,c2=st.columns(2)
+            with c1: st.download_button('Exportar referências',view.to_csv(index=False).encode('utf-8-sig'),'referencias_historicas_precificacao.csv','text/csv',use_container_width=True)
+            with c2:
+                ids=st.text_input('IDs para excluir',placeholder='Ex.: 2, 8',key='ids_excluir_ref')
+                if st.button('Excluir referências',use_container_width=True,key='excluir_ref'):
+                    try: excluir_referencias([int(x.strip()) for x in ids.split(',') if x.strip()]); st.success('Referências excluídas.'); st.rerun()
+                    except Exception: st.error('Informe IDs válidos separados por vírgula.')
+    with aba_imp:
+        st.markdown('<div class="section-title">Importação do histórico real</div>',unsafe_allow_html=True)
+        st.info('O Controle de Contratos entra como valor mensal contratado. A BASE BI é filtrada para locação e entra como faturamento histórico. Duplicados são ignorados automaticamente.')
+        c1,c2=st.columns(2)
+        with c1:
+            arq=st.file_uploader('Controle de Contratos',type=['xlsx','xlsm'],key='upload_contratos_hist')
+            if st.button('Importar contratos',use_container_width=True,key='btn_importar_contratos'):
+                if arq is None: st.warning('Selecione o arquivo de contratos.')
+                else:
+                    try:r=importar_controle_contratos(arq); st.success(f"{r['inseridos']} contratos importados; {r['ignorados']} duplicados ignorados.")
+                    except Exception as e: st.error(f'Não foi possível importar: {e}')
+        with c2:
+            arq=st.file_uploader('BASE BI',type=['xlsx','xlsm'],key='upload_base_bi_hist')
+            if st.button('Importar faturamento de locação',use_container_width=True,key='btn_importar_bi'):
+                if arq is None: st.warning('Selecione o arquivo BASE BI.')
+                else:
+                    try:r=importar_base_bi(arq); st.success(f"{r['inseridos']} linhas de locação importadas; {r['ignorados']} duplicadas ignoradas.")
+                    except Exception as e: st.error(f'Não foi possível importar: {e}')
+
+# ======================================================
+# HISTÓRICO DE COTAÇÕES
+# ======================================================
+elif menu == "5 - Histórico de Cotações":
     st.markdown(
         """
         <div class="hero">
-            <h1>Histórico de Precificação</h1>
-            <p>Lista única de novos e usados já precificados.</p>
+            <h1>Histórico de Cotações</h1>
+            <p>Banco de referências cambiais utilizadas nas precificações.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    h = historico()
-    if h.empty:
-        st.info("Nenhuma precificação salva.")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Consultar e salvar PTAX agora", use_container_width=True):
+            try:
+                valor_ptax, data_cot, data_consulta = ptax()
+                novo_id = salvar_cotacao(
+                    {
+                        "data_hora_registro": datetime.now(
+                            ZoneInfo("America/Sao_Paulo")
+                        ).strftime("%d/%m/%Y %H:%M:%S"),
+                        "data_hora_cotacao": data_cot,
+                        "data_hora_consulta_brasilia": data_consulta,
+                        "valor": valor_ptax,
+                        "fonte": "PTAX de venda - Banco Central do Brasil",
+                        "origem": "Automática",
+                        "finalidade": "Referência cambial",
+                        "cliente": "",
+                        "equipamento": "",
+                        "observacao": "",
+                        "usada_em_precificacao": 0,
+                    }
+                )
+                st.success(f"PTAX salva no registro {novo_id}.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Não foi possível consultar a PTAX: {exc}")
+
+    with col2:
+        with st.expander("Cadastrar cotação manual"):
+            valor_manual = st.number_input(
+                "Cotação em R$", 0.01, value=5.50, step=0.01, format="%.4f"
+            )
+            data_manual = st.date_input(
+                "Data da cotação", date.today(), format="DD/MM/YYYY"
+            )
+            finalidade_manual = st.text_input("Finalidade")
+            cliente_manual = st.text_input("Cliente")
+            equipamento_manual = st.text_input("Equipamento")
+            observacao_manual = st.text_area("Observação")
+            if st.button("Salvar cotação manual", use_container_width=True):
+                agora_br = datetime.now(
+                    ZoneInfo("America/Sao_Paulo")
+                ).strftime("%d/%m/%Y %H:%M:%S")
+                salvar_cotacao(
+                    {
+                        "data_hora_registro": agora_br,
+                        "data_hora_cotacao": data_manual.strftime("%d/%m/%Y"),
+                        "data_hora_consulta_brasilia": agora_br,
+                        "valor": valor_manual,
+                        "fonte": "Informada manualmente",
+                        "origem": "Manual",
+                        "finalidade": finalidade_manual,
+                        "cliente": cliente_manual,
+                        "equipamento": equipamento_manual,
+                        "observacao": observacao_manual,
+                        "usada_em_precificacao": 0,
+                    }
+                )
+                st.success("Cotação manual salva.")
+                st.rerun()
+
+    cotacoes = historico_cotacoes()
+    if cotacoes.empty:
+        st.info("Nenhuma cotação salva.")
     else:
-        col1, col2, col3 = st.columns(3)
-        tipos = col1.multiselect(
-            "Tipo",
-            ["Novo", "Usado"],
-            default=["Novo", "Usado"],
-        )
-        cliente = col2.text_input("Cliente")
-        equipamento = col3.text_input("Equipamento")
-
-        view = h.copy()
-        if tipos:
-            view = view[view["tipo"].isin(tipos)]
-        if cliente:
-            view = view[
-                view["cliente"].str.contains(
-                    cliente,
-                    case=False,
-                    na=False,
-                )
-            ]
-        if equipamento:
-            view = view[
-                view["equipamento"].str.contains(
-                    equipamento,
-                    case=False,
-                    na=False,
-                )
-            ]
-
-        cols = [
-            "id",
-            "data_hora",
-            "tipo",
-            "cliente",
-            "equipamento",
-            "fabricante",
-            "prazo",
-            "investimento",
-            "aluguel",
-            "aluguel_minimo",
-            "lucro",
-            "lucro_reforma",
-            "margem",
-            "payback",
-            "depreciacao",
-            "valor_contabil",
-            "origem",
+        cards_cot = [
+            ("Última cotação", f"R$ {cotacoes.iloc[0]['valor']:.4f}", cotacoes.iloc[0]['origem']),
+            ("Média histórica", f"R$ {cotacoes['valor'].mean():.4f}", f"{len(cotacoes)} registros"),
+            ("Menor cotação", f"R$ {cotacoes['valor'].min():.4f}", "Base salva"),
+            ("Maior cotação", f"R$ {cotacoes['valor'].max():.4f}", "Base salva"),
         ]
+        cols = st.columns(4)
+        for col, item in zip(cols, cards_cot):
+            with col:
+                card(*item)
 
-        st.dataframe(
-            tabela_formatada(
-                view[cols],
-                money=[
-                    "investimento",
-                    "aluguel",
-                    "aluguel_minimo",
-                    "lucro",
-                    "lucro_reforma",
-                    "valor_contabil",
-                ],
-                percent=[
-                    "margem",
-                    "depreciacao",
-                ],
-                months=["payback"],
-            ),
-            use_container_width=True,
-            hide_index=True,
+        st.markdown(
+            '<div class="section-title">Evolução das cotações</div>',
+            unsafe_allow_html=True,
         )
+        grafico = cotacoes.sort_values("id")[["id", "valor"]].set_index("id")
+        st.line_chart(grafico)
 
-        st.download_button(
-            "Exportar histórico",
-            data=view.to_csv(index=False).encode("utf-8-sig"),
-            file_name="historico_precificacao.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        col1, col2, col3 = st.columns(3)
+        origens = sorted(cotacoes["origem"].dropna().unique().tolist())
+        filtro_origem = col1.multiselect("Origem", origens, default=origens)
+        filtro_finalidade = col2.text_input("Finalidade contém")
+        somente_usadas = col3.checkbox("Somente usadas em precificação")
+
+        view = cotacoes.copy()
+        if filtro_origem:
+            view = view[view["origem"].isin(filtro_origem)]
+        if filtro_finalidade:
+            view = view[
+                view["finalidade"].str.contains(
+                    filtro_finalidade, case=False, na=False
+                )
+            ]
+        if somente_usadas:
+            view = view[view["usada_em_precificacao"] == 1]
+
+        exibicao = view.copy()
+        exibicao["valor"] = exibicao["valor"].map(lambda x: f"R$ {x:.4f}")
+        exibicao["usada_em_precificacao"] = exibicao[
+            "usada_em_precificacao"
+        ].map({1: "Sim", 0: "Não"})
+        st.dataframe(exibicao, use_container_width=True, hide_index=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "Exportar cotações",
+                data=view.to_csv(index=False).encode("utf-8-sig"),
+                file_name="historico_cotacoes.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with col2:
+            ids_texto = st.text_input("IDs para excluir", placeholder="Ex.: 2, 5")
+            if st.button("Excluir cotações", use_container_width=True):
+                try:
+                    ids = [
+                        int(x.strip())
+                        for x in ids_texto.split(",")
+                        if x.strip()
+                    ]
+                    excluir_cotacoes(ids)
+                    st.success("Cotações excluídas.")
+                    st.rerun()
+                except Exception:
+                    st.error("Informe IDs válidos separados por vírgula.")
 
 # ======================================================
 # PARÂMETROS
 # ======================================================
-elif menu == "5 - Parâmetros":
+elif menu == "6 - Parâmetros":
     st.markdown(
         """
         <div class="hero">
@@ -2050,9 +2865,11 @@ elif menu == "5 - Parâmetros":
             ["Nacionalização de novos importados", "65,00% editável"],
             ["Aquisição nacional", "Valor informado diretamente em R$"],
             ["Dólar", "PTAX de venda do Banco Central"],
+            ["Banco de cotações", "SQLite com PTAX automática e registros manuais"],
+            ["Proposta comercial", "Download em PDF para novos e usados"],
             ["Comissão vendedor", "5,00%"],
             ["Comissão gerente", "0,50%"],
-            ["Comissão representante", "14,00% editável"],
+            ["Comissões", "Vendedor, gerente e representante podem ser cumulativas"],
             ["Margem desejada", "25,00%"],
             ["Financiamento", "Tabela Price; 1,60% a.m."],
             ["Vida útil padrão", "10 anos"],
