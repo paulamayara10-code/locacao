@@ -129,6 +129,12 @@ BASE_BI_GIT_ALTERNATIVAS = [
     "BASE BI(2).xlsx",
 ]
 
+# Sempre que a regra de leitura da BASE BI mudar, altere esta versão.
+# Isso força a limpeza e a reconstrução das referências importadas.
+BASE_BI_REGRA_IMPORTACAO = (
+    "V29_FATURAMENTO_EXCLUSIVO_VALOR_BRUTO_POR_QUANTIDADE"
+)
+
 IMPOSTO_ATUAL = 14.30
 NACIONALIZACAO_PADRAO = 65.00
 COMISSAO_VENDEDOR = 5.00
@@ -718,11 +724,15 @@ def sincronizar_central_pricing(forcar=False):
 @st.cache_resource(show_spinner=False)
 def inicializar_bases_pricing():
     """Executa as rotinas pesadas somente uma vez por processo."""
+    status_regra = aplicar_regra_base_bi_atual()
     status_base = sincronizar_base_bi_git()
 
-    # A migração só é necessária quando a base mudou ou quando
-    # ainda não há referências consolidadas.
-    forcar = status_base.get("status") == "Importada"
+    # A migração é forçada quando a regra mudou, quando a base mudou
+    # ou quando ainda não há referências consolidadas.
+    forcar = (
+        status_regra.get("aplicada", False)
+        or status_base.get("status") == "Importada"
+    )
     status_pricing = sincronizar_central_pricing(
         forcar=forcar
     )
@@ -967,26 +977,218 @@ def importar_controle_contratos(arquivo):
     return salvar_referencias(regs)
 
 def importar_base_bi(arquivo):
-    abas=pd.read_excel(arquivo,sheet_name=None,engine='openpyxl')
-    nome=next((n for n in abas if 'BANCO DE DADOS FATURAMENTO' in normalizar_texto_coluna(n)),None)
-    if not nome: raise ValueError('A aba BANCO DE DADOS FATURAMENTO não foi encontrada.')
-    df=abas[nome].dropna(how='all').copy()
-    c={k:localizar_coluna(df,v) for k,v in {
-      'categoria':['CATEGORIA'],'numero':['NUMERO','NÚMERO'],'data':['DT EMISSAO','DT EMISSÃO'],'cod':['CLIENTE'],'cliente':['NOME DO CLIENTE'],'resp':['VENDEDOR / REPRESENTANTE'],'produto':['PRODUTO'],'desc':['DESCRIÇÃO','DESCRICAO'],'qtd':['QUANTIDADE'],'preco':['PREÇO UNITÁRIO','PRECO UNITARIO'],'valor':['VALOR'],'bruto':['VALOR BRUTO'],'nf':['NOTA FISCAL'],'segmento':['SEGMENTO'],'gerente':['GERENTE'],'fornecedor':['FORNECEDOR'],'linha':['LINHA DE PRODUTO'],'nova':['NOVA']}.items()}
-    if not c['cliente'] or not c['produto']: raise ValueError('Colunas mínimas não encontradas na BASE BI.')
-    mask=pd.Series(False,index=df.index)
-    for col in [c['categoria'],c['nova'],c['segmento']]:
-        if col: mask |= df[col].fillna('').astype(str).map(normalizar_texto_coluna).str.contains(r'LOCA|ALUG',regex=True,na=False)
-    df=df[mask].copy(); agora=datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%d/%m/%Y %H:%M:%S'); regs=[]
-    for _,r in df.iterrows():
-        cliente=texto_limpo(r.get(c['cliente'])); produto=texto_limpo(r.get(c['produto'])); desc=texto_limpo(r.get(c['desc'])) if c['desc'] else ''
-        nota=texto_limpo(r.get(c['nf'])) if c['nf'] else ''; numero=texto_limpo(r.get(c['numero'])) if c['numero'] else ''
-        qtd=numero_limpo(r.get(c['qtd'])) if c['qtd'] else 0; preco=numero_limpo(r.get(c['preco'])) if c['preco'] else 0
-        total=numero_limpo(r.get(c['bruto'])) if c['bruto'] else 0
-        if total<=0 and c['valor']: total=numero_limpo(r.get(c['valor']))
-        if not cliente or not produto or (preco<=0 and total<=0): continue
-        regs.append({'chave_unica':chave_historica('FATURAMENTO',nota,numero,produto,cliente,qtd,preco,total),'data_importacao':agora,'fonte':'BASE BI - Faturamento','tipo_referencia':'Locação faturada','identificador':numero,'data_referencia':data_excel_para_br(r.get(c['data'])) if c['data'] else '','cliente_codigo':texto_limpo(r.get(c['cod'])) if c['cod'] else '','cliente':cliente,'cnpj':'','equipamento_codigo':produto,'equipamento':desc or produto,'linha_produto':texto_limpo(r.get(c['linha'])) if c['linha'] else '','quantidade':qtd,'valor_unitario':preco,'valor_mensal':total,'valor_total':total,'vendedor':texto_limpo(r.get(c['resp'])) if c['resp'] else '','gerente':texto_limpo(r.get(c['gerente'])) if c['gerente'] else '','sla':'','origem_contrato':texto_limpo(r.get(c['fornecedor'])) if c['fornecedor'] else '','nota_fiscal':nota,'observacao':'Referência de faturamento de locação; valores preservados conforme a base.'})
-    return salvar_referencias(regs)
+    """Importa referências exclusivamente de faturamento de locação.
+
+    Regras:
+    - CATEGORIA deve ser exatamente FATURAMENTO;
+    - a operação também deve ser identificada como locação/aluguel;
+    - o preço de referência utiliza exclusivamente VALOR BRUTO;
+    - preço unitário de referência = VALOR BRUTO / QUANTIDADE;
+    - não existe fallback para VALOR ou PREÇO UNITÁRIO.
+    """
+    abas = pd.read_excel(
+        arquivo,
+        sheet_name=None,
+        engine="openpyxl",
+    )
+    nome = next(
+        (
+            nome_aba
+            for nome_aba in abas
+            if "BANCO DE DADOS FATURAMENTO"
+            in normalizar_texto_coluna(nome_aba)
+        ),
+        None,
+    )
+    if not nome:
+        raise ValueError(
+            "A aba BANCO DE DADOS FATURAMENTO não foi encontrada."
+        )
+
+    df = abas[nome].dropna(how="all").copy()
+
+    c = {
+        chave: localizar_coluna(df, alternativas)
+        for chave, alternativas in {
+            "categoria": ["CATEGORIA"],
+            "numero": ["NUMERO", "NÚMERO"],
+            "data": ["DT EMISSAO", "DT EMISSÃO"],
+            "cod": ["CLIENTE"],
+            "cliente": ["NOME DO CLIENTE"],
+            "resp": ["VENDEDOR / REPRESENTANTE"],
+            "produto": ["PRODUTO"],
+            "desc": ["DESCRIÇÃO", "DESCRICAO"],
+            "qtd": ["QUANTIDADE"],
+            "bruto": ["VALOR BRUTO"],
+            "nf": ["NOTA FISCAL"],
+            "segmento": ["SEGMENTO"],
+            "gerente": ["GERENTE"],
+            "fornecedor": ["FORNECEDOR"],
+            "linha": ["LINHA DE PRODUTO"],
+            "nova": ["NOVA"],
+        }.items()
+    }
+
+    obrigatorias = [
+        c["categoria"],
+        c["cliente"],
+        c["produto"],
+        c["bruto"],
+    ]
+    if any(coluna is None for coluna in obrigatorias):
+        raise ValueError(
+            "A BASE BI precisa conter as colunas CATEGORIA, "
+            "NOME DO CLIENTE, PRODUTO e VALOR BRUTO."
+        )
+
+    # 1. Exclusivamente operações classificadas como FATURAMENTO.
+    categoria_normalizada = (
+        df[c["categoria"]]
+        .fillna("")
+        .astype(str)
+        .map(normalizar_texto_coluna)
+    )
+    mascara_faturamento = categoria_normalizada.eq("FATURAMENTO")
+
+    # 2. Como o sistema é de locação, mantém somente linhas identificadas
+    # como locação/aluguel nas colunas operacionais disponíveis.
+    mascara_locacao = pd.Series(False, index=df.index)
+    colunas_locacao = [
+        coluna
+        for coluna in [c["nova"], c["segmento"], c["linha"]]
+        if coluna
+    ]
+
+    for coluna in colunas_locacao:
+        textos = (
+            df[coluna]
+            .fillna("")
+            .astype(str)
+            .map(normalizar_texto_coluna)
+        )
+        mascara_locacao = mascara_locacao | textos.str.contains(
+            r"LOCA|ALUG",
+            regex=True,
+            na=False,
+        )
+
+    # Se a base não tiver nenhuma coluna apta a indicar locação,
+    # o filtro de faturamento continua sendo obrigatório.
+    if colunas_locacao:
+        df = df[mascara_faturamento & mascara_locacao].copy()
+    else:
+        df = df[mascara_faturamento].copy()
+
+    agora = datetime.now(
+        ZoneInfo("America/Sao_Paulo")
+    ).strftime("%d/%m/%Y %H:%M:%S")
+
+    registros = []
+
+    for _, row in df.iterrows():
+        cliente = texto_limpo(row.get(c["cliente"]))
+        produto = texto_limpo(row.get(c["produto"]))
+        descricao = (
+            texto_limpo(row.get(c["desc"]))
+            if c["desc"]
+            else ""
+        )
+        nota = (
+            texto_limpo(row.get(c["nf"]))
+            if c["nf"]
+            else ""
+        )
+        numero = (
+            texto_limpo(row.get(c["numero"]))
+            if c["numero"]
+            else ""
+        )
+
+        quantidade = (
+            numero_limpo(row.get(c["qtd"]))
+            if c["qtd"]
+            else 1.0
+        )
+        if quantidade <= 0:
+            quantidade = 1.0
+
+        # Fonte única e obrigatória da referência de preço.
+        valor_bruto = numero_limpo(row.get(c["bruto"]))
+
+        if not cliente or not produto:
+            continue
+
+        # Linhas sem valor bruto positivo não entram na consulta.
+        if valor_bruto <= 0:
+            continue
+
+        preco_unitario_bruto = valor_bruto / quantidade
+
+        registros.append(
+            {
+                "chave_unica": chave_historica(
+                    BASE_BI_REGRA_IMPORTACAO,
+                    nota,
+                    numero,
+                    produto,
+                    cliente,
+                    quantidade,
+                    valor_bruto,
+                ),
+                "data_importacao": agora,
+                "fonte": "BASE BI - Faturamento",
+                "tipo_referencia": "Locação faturada",
+                "identificador": numero,
+                "data_referencia": (
+                    data_excel_para_br(row.get(c["data"]))
+                    if c["data"]
+                    else ""
+                ),
+                "cliente_codigo": (
+                    texto_limpo(row.get(c["cod"]))
+                    if c["cod"]
+                    else ""
+                ),
+                "cliente": cliente,
+                "cnpj": "",
+                "equipamento_codigo": produto,
+                "equipamento": descricao or produto,
+                "linha_produto": (
+                    texto_limpo(row.get(c["linha"]))
+                    if c["linha"]
+                    else ""
+                ),
+                "quantidade": quantidade,
+                # Ambas as referências derivam exclusivamente do Valor Bruto.
+                "valor_unitario": preco_unitario_bruto,
+                "valor_mensal": valor_bruto,
+                "valor_total": valor_bruto,
+                "vendedor": (
+                    texto_limpo(row.get(c["resp"]))
+                    if c["resp"]
+                    else ""
+                ),
+                "gerente": (
+                    texto_limpo(row.get(c["gerente"]))
+                    if c["gerente"]
+                    else ""
+                ),
+                "sla": "",
+                "origem_contrato": (
+                    texto_limpo(row.get(c["fornecedor"]))
+                    if c["fornecedor"]
+                    else ""
+                ),
+                "nota_fiscal": nota,
+                "observacao": (
+                    "Operação exclusivamente de FATURAMENTO. "
+                    "Valor mensal total = VALOR BRUTO. "
+                    "Preço mensal unitário = VALOR BRUTO / QUANTIDADE."
+                ),
+            }
+        )
+
+    return salvar_referencias(registros)
 
 
 def localizar_base_bi_git():
@@ -1111,6 +1313,115 @@ def historico_importacoes_git():
     return df
 
 
+
+def hash_regra_base_bi():
+    return hashlib.sha256(
+        BASE_BI_REGRA_IMPORTACAO.encode("utf-8")
+    ).hexdigest()
+
+
+def regra_base_bi_ja_aplicada():
+    return consultar_importacao_por_hash(
+        hash_regra_base_bi()
+    ) is not None
+
+
+def limpar_referencias_antigas_base_bi():
+    """Remove referências importadas pelas regras anteriores.
+
+    Não afeta contratos, simulações nem referências manuais.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        historicas = conn.execute(
+            """
+            DELETE FROM referencias_historicas
+            WHERE UPPER(COALESCE(fonte, ''))
+                  LIKE 'BASE BI%'
+            """
+        ).rowcount
+
+        pricing = conn.execute(
+            """
+            DELETE FROM referencias_preco
+            WHERE UPPER(COALESCE(fonte, ''))
+                  LIKE 'BASE BI%'
+            """
+        ).rowcount
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "historicas_excluidas": max(int(historicas or 0), 0),
+        "pricing_excluidas": max(int(pricing or 0), 0),
+    }
+
+
+def registrar_regra_base_bi_aplicada(resultado_limpeza):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO arquivos_importados(
+                caminho,
+                nome_arquivo,
+                hash_sha256,
+                data_importacao,
+                fonte,
+                registros_inseridos,
+                registros_ignorados,
+                status,
+                mensagem
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "",
+                BASE_BI_REGRA_IMPORTACAO,
+                hash_regra_base_bi(),
+                datetime.now(
+                    ZoneInfo("America/Sao_Paulo")
+                ).strftime("%d/%m/%Y %H:%M:%S"),
+                "Regra de importação BASE BI",
+                0,
+                0,
+                "Regra aplicada",
+                (
+                    f"{resultado_limpeza['historicas_excluidas']} "
+                    "referências históricas antigas e "
+                    f"{resultado_limpeza['pricing_excluidas']} "
+                    "referências de pricing antigas removidas."
+                ),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def aplicar_regra_base_bi_atual():
+    if regra_base_bi_ja_aplicada():
+        return {
+            "aplicada": False,
+            "mensagem": "Regra atual já aplicada.",
+        }
+
+    resultado = limpar_referencias_antigas_base_bi()
+    registrar_regra_base_bi_aplicada(resultado)
+
+    return {
+        "aplicada": True,
+        "mensagem": (
+            "Referências antigas da BASE BI foram removidas "
+            "para reconstrução pela regra atual."
+        ),
+        **resultado,
+    }
+
+
+
 def sincronizar_base_bi_git():
     """Importa a BASE BI do Git somente quando o conteúdo mudar.
 
@@ -1131,7 +1442,14 @@ def sincronizar_base_bi_git():
             "ignorados": 0,
         }
 
-    hash_arquivo = hash_sha256_arquivo(caminho)
+    hash_conteudo = hash_sha256_arquivo(caminho)
+    hash_arquivo = hashlib.sha256(
+        (
+            hash_conteudo
+            + "|"
+            + BASE_BI_REGRA_IMPORTACAO
+        ).encode("utf-8")
+    ).hexdigest()
     existente = consultar_importacao_por_hash(hash_arquivo)
 
     if existente:
