@@ -132,7 +132,7 @@ BASE_BI_GIT_ALTERNATIVAS = [
 # Sempre que a regra de leitura da BASE BI mudar, altere esta versão.
 # Isso força a limpeza e a reconstrução das referências importadas.
 BASE_BI_REGRA_IMPORTACAO = (
-    "V29_FATURAMENTO_EXCLUSIVO_VALOR_BRUTO_POR_QUANTIDADE"
+    "V30_NOVA_LOCACAO_VALOR_BRUTO_POR_QUANTIDADE"
 )
 
 IMPOSTO_ATUAL = 14.30
@@ -977,20 +977,21 @@ def importar_controle_contratos(arquivo):
     return salvar_referencias(regs)
 
 def importar_base_bi(arquivo):
-    """Importa referências exclusivamente de faturamento de locação.
+    """Importa o histórico de preços de locação da BASE BI.
 
-    Regras:
-    - CATEGORIA deve ser exatamente FATURAMENTO;
-    - a operação também deve ser identificada como locação/aluguel;
-    - o preço de referência utiliza exclusivamente VALOR BRUTO;
-    - preço unitário de referência = VALOR BRUTO / QUANTIDADE;
-    - não existe fallback para VALOR ou PREÇO UNITÁRIO.
+    A coluna NOVA define a natureza da operação. Somente as linhas
+    classificadas como LOCAÇÃO entram na central de consulta.
+
+    O VALOR BRUTO é a única referência financeira utilizada:
+    - valor mensal total = VALOR BRUTO;
+    - preço mensal por equipamento = VALOR BRUTO / QUANTIDADE.
     """
     abas = pd.read_excel(
         arquivo,
         sheet_name=None,
         engine="openpyxl",
     )
+
     nome = next(
         (
             nome_aba
@@ -1000,9 +1001,10 @@ def importar_base_bi(arquivo):
         ),
         None,
     )
+
     if not nome:
         raise ValueError(
-            "A aba BANCO DE DADOS FATURAMENTO não foi encontrada."
+            "A planilha de faturamento não foi encontrada na BASE BI."
         )
 
     df = abas[nome].dropna(how="all").copy()
@@ -1010,7 +1012,6 @@ def importar_base_bi(arquivo):
     c = {
         chave: localizar_coluna(df, alternativas)
         for chave, alternativas in {
-            "categoria": ["CATEGORIA"],
             "numero": ["NUMERO", "NÚMERO"],
             "data": ["DT EMISSAO", "DT EMISSÃO"],
             "cod": ["CLIENTE"],
@@ -1021,7 +1022,6 @@ def importar_base_bi(arquivo):
             "qtd": ["QUANTIDADE"],
             "bruto": ["VALOR BRUTO"],
             "nf": ["NOTA FISCAL"],
-            "segmento": ["SEGMENTO"],
             "gerente": ["GERENTE"],
             "fornecedor": ["FORNECEDOR"],
             "linha": ["LINHA DE PRODUTO"],
@@ -1030,54 +1030,26 @@ def importar_base_bi(arquivo):
     }
 
     obrigatorias = [
-        c["categoria"],
+        c["nova"],
         c["cliente"],
         c["produto"],
         c["bruto"],
     ]
+
     if any(coluna is None for coluna in obrigatorias):
         raise ValueError(
-            "A BASE BI precisa conter as colunas CATEGORIA, "
+            "A BASE BI precisa conter as colunas NOVA, "
             "NOME DO CLIENTE, PRODUTO e VALOR BRUTO."
         )
 
-    # 1. Exclusivamente operações classificadas como FATURAMENTO.
-    categoria_normalizada = (
-        df[c["categoria"]]
+    natureza_operacao = (
+        df[c["nova"]]
         .fillna("")
         .astype(str)
         .map(normalizar_texto_coluna)
     )
-    mascara_faturamento = categoria_normalizada.eq("FATURAMENTO")
 
-    # 2. Como o sistema é de locação, mantém somente linhas identificadas
-    # como locação/aluguel nas colunas operacionais disponíveis.
-    mascara_locacao = pd.Series(False, index=df.index)
-    colunas_locacao = [
-        coluna
-        for coluna in [c["nova"], c["segmento"], c["linha"]]
-        if coluna
-    ]
-
-    for coluna in colunas_locacao:
-        textos = (
-            df[coluna]
-            .fillna("")
-            .astype(str)
-            .map(normalizar_texto_coluna)
-        )
-        mascara_locacao = mascara_locacao | textos.str.contains(
-            r"LOCA|ALUG",
-            regex=True,
-            na=False,
-        )
-
-    # Se a base não tiver nenhuma coluna apta a indicar locação,
-    # o filtro de faturamento continua sendo obrigatório.
-    if colunas_locacao:
-        df = df[mascara_faturamento & mascara_locacao].copy()
-    else:
-        df = df[mascara_faturamento].copy()
+    df = df[natureza_operacao.eq("LOCACAO")].copy()
 
     agora = datetime.now(
         ZoneInfo("America/Sao_Paulo")
@@ -1112,14 +1084,9 @@ def importar_base_bi(arquivo):
         if quantidade <= 0:
             quantidade = 1.0
 
-        # Fonte única e obrigatória da referência de preço.
         valor_bruto = numero_limpo(row.get(c["bruto"]))
 
-        if not cliente or not produto:
-            continue
-
-        # Linhas sem valor bruto positivo não entram na consulta.
-        if valor_bruto <= 0:
+        if not cliente or not produto or valor_bruto <= 0:
             continue
 
         preco_unitario_bruto = valor_bruto / quantidade
@@ -1136,8 +1103,8 @@ def importar_base_bi(arquivo):
                     valor_bruto,
                 ),
                 "data_importacao": agora,
-                "fonte": "BASE BI - Faturamento",
-                "tipo_referencia": "Locação faturada",
+                "fonte": "BASE BI - Locação faturada",
+                "tipo_referencia": "Preço faturado",
                 "identificador": numero,
                 "data_referencia": (
                     data_excel_para_br(row.get(c["data"]))
@@ -1159,7 +1126,6 @@ def importar_base_bi(arquivo):
                     else ""
                 ),
                 "quantidade": quantidade,
-                # Ambas as referências derivam exclusivamente do Valor Bruto.
                 "valor_unitario": preco_unitario_bruto,
                 "valor_mensal": valor_bruto,
                 "valor_total": valor_bruto,
@@ -1181,9 +1147,9 @@ def importar_base_bi(arquivo):
                 ),
                 "nota_fiscal": nota,
                 "observacao": (
-                    "Operação exclusivamente de FATURAMENTO. "
-                    "Valor mensal total = VALOR BRUTO. "
-                    "Preço mensal unitário = VALOR BRUTO / QUANTIDADE."
+                    "Locação identificada pela coluna NOVA. "
+                    "Preço total conforme VALOR BRUTO e preço por "
+                    "equipamento calculado pela quantidade faturada."
                 ),
             }
         )
@@ -2363,7 +2329,7 @@ status_base_bi_git, status_central_pricing = (
 # MENU
 # ======================================================
 st.sidebar.markdown("## FIRST MEDICAL")
-st.sidebar.markdown("### Central de Pricing de Locação")
+st.sidebar.markdown("### Central de Preços de Locação")
 st.sidebar.markdown("---")
 
 menu = st.sidebar.radio(
@@ -2373,11 +2339,9 @@ menu = st.sidebar.radio(
         "1 - Central de Consulta",
         "2 - Formação de Preço - Novos",
         "3 - Formação de Preço - Usados",
-        "4 - Referências de Preço",
-        "5 - Histórico de Simulações",
-        "6 - Equipamentos e Ativos",
-        "7 - Indicadores de Apoio",
-        "8 - Parâmetros",
+        "4 - Histórico de Simulações",
+        "5 - Equipamentos e Ativos",
+        "6 - Configurações de Cálculo",
     ],
 )
 
@@ -2386,30 +2350,49 @@ st.session_state["_active_menu"] = menu
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    "Consulta | Formação de preço | Histórico real"
+    "Consulte preços, monte propostas e acompanhe as simulações."
 )
 
-with st.sidebar.expander("Base histórica no Git", expanded=False):
-    if status_base_bi_git["status"] in {"Importada", "Atualizada"}:
-        st.success(status_base_bi_git["status"])
-    elif status_base_bi_git["status"] == "Ausente":
-        st.warning("Arquivo não localizado")
-    else:
-        st.error("Falha na sincronização")
+with st.sidebar.expander(
+    "Atualização do histórico de preços",
+    expanded=False,
+):
+    status_atualizacao = status_base_bi_git.get("status", "")
 
-    st.caption(status_base_bi_git["mensagem"])
+    if status_atualizacao == "Importada":
+        st.success("Novos preços foram incluídos no histórico.")
+    elif status_atualizacao == "Atualizada":
+        st.success("O histórico de preços está atualizado.")
+    elif status_atualizacao == "Ausente":
+        st.warning("A BASE BI não foi encontrada.")
+        st.caption(
+            "Inclua o arquivo base_bi.xlsx na raiz do repositório."
+        )
+    else:
+        st.error("Não foi possível atualizar o histórico.")
+        if status_base_bi_git.get("mensagem"):
+            st.caption(status_base_bi_git["mensagem"])
+
     if status_base_bi_git.get("caminho"):
         st.caption(
-            f"Arquivo: {Path(status_base_bi_git['caminho']).name}"
+            f"Base utilizada: "
+            f"{Path(status_base_bi_git['caminho']).name}"
         )
 
-    st.caption(
-        f"Central de pricing: "
-        f"{status_central_pricing.get('status', 'OK')}"
+    status_referencias = status_central_pricing.get(
+        "status",
+        "",
     )
+    if status_referencias in {
+        "Sincronizada",
+        "Sem alterações",
+    }:
+        st.caption("Referências prontas para consulta.")
+    else:
+        st.caption("As referências serão atualizadas no próximo acesso.")
 
     if st.button(
-        "Sincronizar histórico agora",
+        "Atualizar base de preços",
         use_container_width=True,
         key="sincronizar_historico_manual",
     ):
@@ -2417,7 +2400,7 @@ with st.sidebar.expander("Base histórica no Git", expanded=False):
         inicializar_bases_pricing.clear()
         st.rerun()
 
-if st.sidebar.button("Limpar rascunho da aba atual", use_container_width=True):
+if st.sidebar.button("Limpar dados desta tela", use_container_width=True):
     _prefix = f"draft__{_slug_widget(menu)}__"
     _explicit_keys = {
         "u_manut",
@@ -2459,7 +2442,7 @@ if menu == "Resumo Executivo":
         """
         <div class="hero">
             <h1>Resumo Executivo</h1>
-            <p>Histórico consolidado de equipamentos novos e usados.</p>
+            <p>Visão geral dos preços praticados, das simulações salvas e das oportunidades de ajuste.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2561,7 +2544,7 @@ elif menu == "1 - Central de Consulta":
         """
         <div class="hero">
             <h1>Central de Consulta e Formação de Preço</h1>
-            <p>Histórico praticado, custo mínimo e faixa recomendada por equipamento.</p>
+            <p>Consulte quanto já foi cobrado e compare com o valor mínimo necessário para montar uma nova proposta.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2752,7 +2735,7 @@ elif menu == "2 - Formação de Preço - Novos":
         """
         <div class="hero">
             <h1>Locação de Equipamentos Novos</h1>
-            <p>FOB, dólar, nacionalização, financiamento, impostos e pós-reforma.</p>
+            <p>Calcule a locação de equipamentos nacionais ou importados e gere uma proposta comercial completa.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3276,7 +3259,7 @@ elif menu == "3 - Formação de Preço - Usados":
         """
         <div class="hero">
             <h1>Locação de Equipamentos Usados</h1>
-            <p>Custo de propriedade + custo operacional + risco + margem.</p>
+            <p>Defina o aluguel considerando o valor do ativo, manutenção, atendimento técnico e retorno esperado.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -4009,12 +3992,12 @@ elif menu == "3 - Formação de Preço - Usados":
 # ======================================================
 # ATIVOS
 # ======================================================
-elif menu == "6 - Equipamentos e Ativos":
+elif menu == "5 - Equipamentos e Ativos":
     st.markdown(
         """
         <div class="hero">
-            <h1>Ativos</h1>
-            <p>Consulta da base pré-cadastrada.</p>
+            <h1>Equipamentos e Ativos</h1>
+            <p>Localize equipamentos cadastrados e utilize seus dados como ponto de partida para uma simulação.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -4048,255 +4031,19 @@ elif menu == "6 - Equipamentos e Ativos":
 # ======================================================
 # HISTÓRICO
 # ======================================================
-elif menu == "4 - Referências de Preço":
-    st.markdown(
-        """
-        <div class="hero">
-            <h1>Referências de Preço</h1>
-            <p>Faturamentos, contratos, propostas e simulações por equipamento.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    aba_lista, aba_nova, aba_importacao, aba_status = st.tabs(
-        ["Lista de referências", "Nova referência", "Importar bases", "Atualizar status"]
-    )
-
-    with aba_lista:
-        refs = referencias_preco()
-        if refs.empty:
-            st.info("Nenhuma referência cadastrada.")
-        else:
-            c1, c2, c3, c4 = st.columns(4)
-            fontes = c1.multiselect(
-                "Tipo de fonte",
-                sorted(refs["tipo_fonte"].dropna().unique().tolist()),
-                default=sorted(refs["tipo_fonte"].dropna().unique().tolist()),
-                key="refs_tipo_fonte",
-            )
-            status = c2.multiselect(
-                "Status",
-                sorted(refs["status"].dropna().unique().tolist()),
-                default=sorted(refs["status"].dropna().unique().tolist()),
-                key="refs_status",
-            )
-            equip = c3.text_input("Equipamento contém", key="refs_equip")
-            cliente = c4.text_input("Cliente contém", key="refs_cliente")
-
-            view = refs.copy()
-            if fontes:
-                view = view[view["tipo_fonte"].isin(fontes)]
-            if status:
-                view = view[view["status"].isin(status)]
-            if equip:
-                mask = pd.Series(False, index=view.index)
-                for col_busca in ["equipamento_codigo", "equipamento", "linha_produto"]:
-                    mask |= view[col_busca].fillna("").str.contains(equip, case=False, na=False)
-                view = view[mask]
-            if cliente:
-                view = view[view["cliente"].fillna("").str.contains(cliente, case=False, na=False)]
-
-            cards_refs = [
-                ("Referências", len(view), "Registros filtrados"),
-                ("Preço médio unitário", moeda(pd.to_numeric(view["preco_mensal_unitario"], errors="coerce").mean()), "Preço mensal"),
-                ("Confiança média", perc(pd.to_numeric(view["confianca_pct"], errors="coerce").mean()), "Peso das fontes"),
-                ("Equipamentos", view[["equipamento_codigo", "equipamento"]].drop_duplicates().shape[0], "Itens distintos"),
-            ]
-            for col_card, item in zip(st.columns(4), cards_refs):
-                with col_card:
-                    card(*item)
-
-            cols_refs = [
-                "id", "data_referencia", "fonte", "tipo_fonte", "status",
-                "confianca_pct", "equipamento_codigo", "equipamento", "fabricante",
-                "linha_produto", "condicao", "origem_produto", "cliente", "uf",
-                "prazo_meses", "quantidade", "preco_mensal_unitario",
-                "valor_mensal_total", "aluguel_minimo_calculado", "margem_pct",
-                "payback_meses", "vendedor", "gerente", "nota_fiscal", "contrato",
-            ]
-            st.dataframe(
-                tabela_formatada(
-                    view[cols_refs],
-                    money=["preco_mensal_unitario", "valor_mensal_total", "aluguel_minimo_calculado"],
-                    percent=["confianca_pct", "margem_pct"],
-                    months=["payback_meses"],
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    "Exportar referências",
-                    view.to_csv(index=False).encode("utf-8-sig"),
-                    "referencias_preco.csv",
-                    "text/csv",
-                    use_container_width=True,
-                )
-            with c2:
-                ids = st.text_input("IDs para excluir", placeholder="Ex.: 2, 8", key="refs_ids_excluir")
-                if st.button("Excluir referências", use_container_width=True, key="refs_excluir"):
-                    try:
-                        excluir_referencias_preco([int(x.strip()) for x in ids.split(",") if x.strip()])
-                        st.success("Referências excluídas.")
-                        st.rerun()
-                    except Exception:
-                        st.error("Informe IDs válidos separados por vírgula.")
-
-    with aba_nova:
-        with st.form("nova_referencia_preco"):
-            c1, c2, c3 = st.columns(3)
-            data_ref = c1.date_input("Data da referência", date.today(), format="DD/MM/YYYY")
-            fonte = c2.selectbox(
-                "Fonte",
-                ["Faturamento real", "Contrato ativo", "Proposta aprovada", "Proposta enviada", "Simulação interna", "Proposta perdida", "Outra referência"],
-            )
-            status = c3.selectbox(
-                "Status",
-                ["Faturada", "Contratada", "Aprovada", "Enviada", "Em negociação", "Rascunho", "Perdida"],
-            )
-            c1, c2, c3 = st.columns(3)
-            cod_eq = c1.text_input("Código do equipamento")
-            eq = c2.text_input("Equipamento")
-            fabricante = c3.text_input("Fabricante / modelo")
-            c1, c2, c3 = st.columns(3)
-            linha = c1.text_input("Linha de produto")
-            condicao = c2.selectbox("Condição", ["Novo", "Usado", "Não informado"])
-            origem_produto = c3.selectbox("Origem", ["Nacional", "Importado", "Não informado"])
-            c1, c2, c3 = st.columns(3)
-            cliente = c1.text_input("Cliente")
-            uf = c2.text_input("UF", max_chars=2)
-            prazo_ref = c3.number_input("Prazo (meses)", min_value=0, value=24, step=1)
-            c1, c2, c3 = st.columns(3)
-            quantidade = c1.number_input("Quantidade", min_value=0.01, value=1.0, step=1.0)
-            preco_unit = input_rs("Preço mensal unitário", 0, "ref_preco_unit")
-            valor_total = input_rs("Valor mensal total", 0, "ref_valor_total")
-            c1, c2, c3 = st.columns(3)
-            vendedor = c1.text_input("Vendedor")
-            gerente = c2.text_input("Gerente")
-            representante = c3.text_input("Representante")
-            c1, c2 = st.columns(2)
-            contrato = c1.text_input("Contrato / proposta")
-            nota = c2.text_input("Nota fiscal")
-            observacao = st.text_area("Observação")
-            salvar_manual = st.form_submit_button("Salvar referência", use_container_width=True)
-
-        if salvar_manual:
-            total = valor_total if valor_total > 0 else preco_unit * quantidade
-            preco = preco_unit if preco_unit > 0 else (total / quantidade if quantidade else 0)
-            chave = chave_historica(
-                "MANUAL", datetime.now().isoformat(), cod_eq, eq, cliente, preco, status
-            )
-            salvar_referencia_preco({
-                "chave_unica": chave,
-                "data_referencia": data_ref.strftime("%d/%m/%Y"),
-                "fonte": fonte,
-                "tipo_fonte": fonte,
-                "confianca_pct": confianca_referencia(fonte, status),
-                "status": status,
-                "equipamento_codigo": cod_eq,
-                "equipamento": eq,
-                "fabricante": fabricante,
-                "linha_produto": linha,
-                "condicao": condicao,
-                "origem_produto": origem_produto,
-                "cliente_codigo": "",
-                "cliente": cliente,
-                "uf": uf.upper(),
-                "prazo_meses": int(prazo_ref),
-                "quantidade": quantidade,
-                "preco_mensal_unitario": preco,
-                "valor_mensal_total": total,
-                "valor_investimento": None,
-                "aluguel_minimo_calculado": None,
-                "margem_pct": None,
-                "payback_meses": None,
-                "vendedor": vendedor,
-                "gerente": gerente,
-                "representante": representante,
-                "nota_fiscal": nota,
-                "contrato": contrato,
-                "simulacao_id": None,
-                "observacao": observacao,
-            })
-            st.success("Referência salva na Central de Pricing.")
-
-    with aba_importacao:
-        st.info(
-            "A BASE BI do Git é sincronizada automaticamente. Os uploads abaixo "
-            "servem para atualizações pontuais e para o Controle de Contratos."
-        )
-        if status_base_bi_git["status"] in {"Importada", "Atualizada"}:
-            st.success(f"BASE BI do Git: {status_base_bi_git['mensagem']}")
-        else:
-            st.warning(status_base_bi_git["mensagem"])
-        c1, c2 = st.columns(2)
-        with c1:
-            arq = st.file_uploader("Controle de Contratos", type=["xlsx", "xlsm"], key="pricing_upload_contratos")
-            if st.button("Importar contratos", use_container_width=True, key="pricing_importar_contratos"):
-                if arq is None:
-                    st.warning("Selecione o arquivo.")
-                else:
-                    try:
-                        r = importar_controle_contratos(arq)
-                        sincronizar_central_pricing()
-                        st.success(f"{r['inseridos']} importados; {r['ignorados']} duplicados.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(str(exc))
-        with c2:
-            arq_bi = st.file_uploader("BASE BI", type=["xlsx", "xlsm"], key="pricing_upload_bi")
-            if st.button("Importar faturamentos", use_container_width=True, key="pricing_importar_bi"):
-                if arq_bi is None:
-                    st.warning("Selecione o arquivo.")
-                else:
-                    try:
-                        r = importar_base_bi(arq_bi)
-                        sincronizar_central_pricing()
-                        st.success(f"{r['inseridos']} importados; {r['ignorados']} duplicados.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(str(exc))
-
-    with aba_status:
-        refs_status = referencias_preco()
-        if refs_status.empty:
-            st.info("Nenhuma referência disponível.")
-        else:
-            ids_disponiveis = refs_status["id"].astype(int).tolist()
-            ref_id = st.selectbox("ID da referência", ids_disponiveis, key="status_ref_id")
-            linha_ref = refs_status[refs_status["id"] == ref_id].iloc[0]
-            st.caption(
-                f"{linha_ref['equipamento']} | {linha_ref['cliente']} | "
-                f"{moeda(linha_ref['preco_mensal_unitario'])} | Status atual: {linha_ref['status']}"
-            )
-            novo_status = st.selectbox(
-                "Novo status",
-                ["Rascunho", "Enviada", "Em negociação", "Aprovada", "Perdida", "Contratada", "Faturada"],
-                key="status_ref_novo",
-            )
-            if st.button("Atualizar status", use_container_width=True):
-                atualizar_status_referencia(ref_id, novo_status)
-                st.success("Status e grau de confiança atualizados.")
-                st.rerun()
-
-# ======================================================
-# HISTÓRICO DE SIMULAÇÕES
-# ======================================================
-elif menu == "5 - Histórico de Simulações":
+elif menu == "4 - Histórico de Simulações":
     st.markdown(
         """
         <div class="hero">
             <h1>Histórico de Simulações</h1>
-            <p>Cálculos financeiros gerados pelo app, separados das referências reais.</p>
+            <p>Consulte propostas já calculadas e reaproveite condições em novas negociações.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
     h = historico()
     if h.empty:
-        st.info("Nenhuma simulação criada no app.")
+        st.info("Ainda não há simulações salvas.")
     else:
         c1, c2, c3 = st.columns(3)
         tipos = c1.multiselect("Tipo", ["Novo", "Usado"], default=["Novo", "Usado"], key="sim_hist_tipo")
@@ -4331,158 +4078,12 @@ elif menu == "5 - Histórico de Simulações":
 # ======================================================
 # HISTÓRICO DE COTAÇÕES
 # ======================================================
-elif menu == "7 - Indicadores de Apoio":
+elif menu == "6 - Configurações de Cálculo":
     st.markdown(
         """
         <div class="hero">
-            <h1>Indicadores de Apoio</h1>
-            <p>PTAX e premissas auxiliares; os preços de equipamentos ficam na Central de Consulta.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Consultar PTAX de apoio", use_container_width=True):
-            try:
-                valor_ptax, data_cot, data_consulta = ptax()
-                novo_id = salvar_cotacao(
-                    {
-                        "data_hora_registro": datetime.now(
-                            ZoneInfo("America/Sao_Paulo")
-                        ).strftime("%d/%m/%Y %H:%M:%S"),
-                        "data_hora_cotacao": data_cot,
-                        "data_hora_consulta_brasilia": data_consulta,
-                        "valor": valor_ptax,
-                        "fonte": "PTAX de venda - Banco Central do Brasil",
-                        "origem": "Automática",
-                        "finalidade": "Referência cambial",
-                        "cliente": "",
-                        "equipamento": "",
-                        "observacao": "",
-                        "usada_em_precificacao": 0,
-                    }
-                )
-                st.success(f"PTAX salva no registro {novo_id}.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Não foi possível consultar a PTAX: {exc}")
-
-    with col2:
-        with st.expander("Cadastrar cotação manual"):
-            valor_manual = st.number_input(
-                "Cotação em R$", 0.01, value=5.50, step=0.01, format="%.4f"
-            )
-            data_manual = st.date_input(
-                "Data da cotação", date.today(), format="DD/MM/YYYY"
-            )
-            finalidade_manual = st.text_input("Finalidade")
-            cliente_manual = st.text_input("Cliente")
-            equipamento_manual = st.text_input("Equipamento")
-            observacao_manual = st.text_area("Observação")
-            if st.button("Salvar cotação manual", use_container_width=True):
-                agora_br = datetime.now(
-                    ZoneInfo("America/Sao_Paulo")
-                ).strftime("%d/%m/%Y %H:%M:%S")
-                salvar_cotacao(
-                    {
-                        "data_hora_registro": agora_br,
-                        "data_hora_cotacao": data_manual.strftime("%d/%m/%Y"),
-                        "data_hora_consulta_brasilia": agora_br,
-                        "valor": valor_manual,
-                        "fonte": "Informada manualmente",
-                        "origem": "Manual",
-                        "finalidade": finalidade_manual,
-                        "cliente": cliente_manual,
-                        "equipamento": equipamento_manual,
-                        "observacao": observacao_manual,
-                        "usada_em_precificacao": 0,
-                    }
-                )
-                st.success("Cotação manual salva.")
-                st.rerun()
-
-    cotacoes = historico_cotacoes()
-    if cotacoes.empty:
-        st.info("Nenhuma cotação salva.")
-    else:
-        cards_cot = [
-            ("Última cotação", f"R$ {cotacoes.iloc[0]['valor']:.4f}", cotacoes.iloc[0]['origem']),
-            ("Média histórica", f"R$ {cotacoes['valor'].mean():.4f}", f"{len(cotacoes)} registros"),
-            ("Menor cotação", f"R$ {cotacoes['valor'].min():.4f}", "Base salva"),
-            ("Maior cotação", f"R$ {cotacoes['valor'].max():.4f}", "Base salva"),
-        ]
-        cols = st.columns(4)
-        for col, item in zip(cols, cards_cot):
-            with col:
-                card(*item)
-
-        st.markdown(
-            '<div class="section-title">Evolução das cotações</div>',
-            unsafe_allow_html=True,
-        )
-        grafico = cotacoes.sort_values("id")[["id", "valor"]].set_index("id")
-        st.line_chart(grafico)
-
-        col1, col2, col3 = st.columns(3)
-        origens = sorted(cotacoes["origem"].dropna().unique().tolist())
-        filtro_origem = col1.multiselect("Origem", origens, default=origens)
-        filtro_finalidade = col2.text_input("Finalidade contém")
-        somente_usadas = col3.checkbox("Somente usadas em precificação")
-
-        view = cotacoes.copy()
-        if filtro_origem:
-            view = view[view["origem"].isin(filtro_origem)]
-        if filtro_finalidade:
-            view = view[
-                view["finalidade"].str.contains(
-                    filtro_finalidade, case=False, na=False
-                )
-            ]
-        if somente_usadas:
-            view = view[view["usada_em_precificacao"] == 1]
-
-        exibicao = view.copy()
-        exibicao["valor"] = exibicao["valor"].map(lambda x: f"R$ {x:.4f}")
-        exibicao["usada_em_precificacao"] = exibicao[
-            "usada_em_precificacao"
-        ].map({1: "Sim", 0: "Não"})
-        st.dataframe(exibicao, use_container_width=True, hide_index=True)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                "Exportar cotações",
-                data=view.to_csv(index=False).encode("utf-8-sig"),
-                file_name="historico_cotacoes.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with col2:
-            ids_texto = st.text_input("IDs para excluir", placeholder="Ex.: 2, 5")
-            if st.button("Excluir cotações", use_container_width=True):
-                try:
-                    ids = [
-                        int(x.strip())
-                        for x in ids_texto.split(",")
-                        if x.strip()
-                    ]
-                    excluir_cotacoes(ids)
-                    st.success("Cotações excluídas.")
-                    st.rerun()
-                except Exception:
-                    st.error("Informe IDs válidos separados por vírgula.")
-
-# ======================================================
-# PARÂMETROS
-# ======================================================
-elif menu == "8 - Parâmetros":
-    st.markdown(
-        """
-        <div class="hero">
-            <h1>Parâmetros</h1>
-            <p>Premissas usadas nas precificações.</p>
+            <h1>Configurações de Cálculo</h1>
+            <p>Consulte os percentuais e critérios adotados na formação dos preços.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -4490,40 +4091,26 @@ elif menu == "8 - Parâmetros":
 
     parametros = pd.DataFrame(
         [
-            ["Impostos atuais", "14,30%"],
-            ["Nacionalização de novos importados", "65,00% editável"],
-            ["Aquisição nacional", "Valor informado diretamente em R$"],
-            ["Dólar", "PTAX de venda do Banco Central"],
-            ["Central de Pricing", "Referências por equipamento, fonte, status e grau de confiança"],
-            ["PTAX", "Indicador auxiliar para formação do custo importado"],
-            ["Proposta comercial", "Download em PDF para novos e usados"],
-            ["Comissão vendedor", "5,00%"],
-            ["Comissão gerente", "0,50%"],
-            ["Comissões", "Vendedor, gerente e representante podem ser cumulativas"],
+            ["Impostos sobre a locação", "14,30%"],
+            ["Equipamento importado", "FOB convertido em reais mais o custo de nacionalização"],
+            ["Custo de nacionalização", "65,00% como valor inicial, com edição permitida"],
+            ["Equipamento nacional", "Valor de aquisição informado diretamente em reais"],
+            ["Dólar para importação", "Cotação de venda do Banco Central, com edição permitida"],
+            ["Referência histórica", "Somente linhas em que a coluna NOVA esteja como LOCAÇÃO"],
+            ["Preço histórico", "VALOR BRUTO total dividido pela quantidade faturada"],
+            ["Comissões", "Vendedor, gerente e representante podem ser somados"],
+            ["Comissão inicial do vendedor", "5,00%"],
+            ["Comissão inicial do gerente", "0,50%"],
             ["Margem desejada", "25,00%"],
-            ["Financiamento", "Tabela Price; 1,60% a.m."],
-            ["Vida útil padrão", "10 anos"],
-            ["CBS pós-reforma", "8,80% editável"],
-            ["IBS pós-reforma", "17,70% editável"],
-            ["Crédito pós-reforma", "100% da base elegível, editável"],
-            [
-                "Modelo de usados",
-                (
-                    "Custos operacionais + reserva técnica + "
-                    "recuperação de capital escolhida"
-                ),
-            ],
-            [
-                "Curva de manutenção dos usados",
-                "2%, 3%, 5%, 7% ou 10% ao ano conforme depreciação",
-            ],
-            [
-                "Horas técnicas sugeridas",
-                "1 a 6 horas/mês conforme depreciação atual",
-            ],
+            ["Financiamento", "Parcelas fixas, com taxa inicial de 1,60% ao mês"],
+            ["Vida útil inicial do equipamento", "10 anos"],
+            ["Simulação após a reforma tributária", "Percentuais de CBS, IBS e créditos podem ser ajustados"],
+            ["Equipamentos usados", "Considera manutenção, atendimento técnico, risco e recuperação do valor do ativo"],
+            ["Manutenção sugerida", "Aumenta conforme o equipamento se aproxima do fim da vida útil"],
         ],
-        columns=["Parâmetro", "Valor"],
+        columns=["Critério", "Como o sistema considera"],
     )
+
 
     st.dataframe(
         parametros,
