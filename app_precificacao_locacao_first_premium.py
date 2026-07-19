@@ -403,40 +403,119 @@ def atualizar_status_referencia(ref_id, status):
     conn.close()
 
 
+def salvar_referencias_preco_lote(registros):
+    """Insere referências em uma única transação SQLite."""
+    if not registros:
+        return {"inseridos": 0, "ignorados": 0}
+
+    agora = datetime.now(
+        ZoneInfo("America/Sao_Paulo")
+    ).strftime("%d/%m/%Y %H:%M:%S")
+
+    preparados = []
+    for registro in registros:
+        dados = dict(registro)
+        dados.setdefault("data_registro", agora)
+        dados.setdefault("quantidade", 1.0)
+        dados.setdefault("status", "Rascunho")
+        dados.setdefault(
+            "confianca_pct",
+            confianca_referencia(
+                dados.get("fonte", ""),
+                dados.get("status", ""),
+            ),
+        )
+        preparados.append(dados)
+
+    colunas = list(preparados[0].keys())
+    valores = [
+        tuple(registro.get(coluna) for coluna in colunas)
+        for registro in preparados
+    ]
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        antes = conn.total_changes
+        nomes = ", ".join(colunas)
+        marcadores = ", ".join(["?"] * len(colunas))
+        conn.executemany(
+            f"""
+            INSERT OR IGNORE INTO referencias_preco({nomes})
+            VALUES({marcadores})
+            """,
+            valores,
+        )
+        conn.commit()
+        inseridos = conn.total_changes - antes
+    finally:
+        conn.close()
+
+    return {
+        "inseridos": int(inseridos),
+        "ignorados": int(len(preparados) - inseridos),
+    }
+
+
 def migrar_referencias_historicas_para_pricing():
     legadas = referencias_historicas()
     if legadas.empty:
         return {"inseridos": 0, "ignorados": 0}
 
-    inseridos = ignorados = 0
+    registros = []
+
     for _, row in legadas.iterrows():
         fonte = texto_limpo(row.get("fonte"))
         tipo_ref = texto_limpo(row.get("tipo_referencia"))
         faturada = "FATURAMENTO" in normalizar_texto_coluna(fonte)
         status = "Faturada" if faturada else "Contratada"
-        tipo_fonte = "Faturamento real" if faturada else "Contrato ativo"
-        qtd = max(numero_limpo(row.get("quantidade")), 1.0)
+        tipo_fonte = (
+            "Faturamento real"
+            if faturada
+            else "Contrato ativo"
+        )
+
+        qtd = max(
+            numero_limpo(row.get("quantidade")),
+            1.0,
+        )
         preco = numero_limpo(row.get("valor_unitario"))
         total = numero_limpo(row.get("valor_mensal"))
+
         if preco <= 0 and total > 0:
             preco = total / qtd
         if total <= 0:
             total = preco * qtd
 
-        ref_id = salvar_referencia_preco({
-            "chave_unica": "LEGADO|" + texto_limpo(row.get("chave_unica")),
-            "data_referencia": texto_limpo(row.get("data_referencia")),
+        registros.append({
+            "chave_unica": (
+                "LEGADO|"
+                + texto_limpo(row.get("chave_unica"))
+            ),
+            "data_referencia": texto_limpo(
+                row.get("data_referencia")
+            ),
             "fonte": fonte,
             "tipo_fonte": tipo_fonte,
-            "confianca_pct": confianca_referencia(fonte, status),
+            "confianca_pct": confianca_referencia(
+                fonte,
+                status,
+            ),
             "status": status,
-            "equipamento_codigo": texto_limpo(row.get("equipamento_codigo")),
-            "equipamento": texto_limpo(row.get("equipamento")),
+            "equipamento_codigo": texto_limpo(
+                row.get("equipamento_codigo")
+            ),
+            "equipamento": texto_limpo(
+                row.get("equipamento")
+            ),
             "fabricante": "",
-            "linha_produto": texto_limpo(row.get("linha_produto")),
+            "linha_produto": texto_limpo(
+                row.get("linha_produto")
+            ),
             "condicao": "Não informado",
             "origem_produto": "Não informado",
-            "cliente_codigo": texto_limpo(row.get("cliente_codigo")),
+            "cliente_codigo": texto_limpo(
+                row.get("cliente_codigo")
+            ),
             "cliente": texto_limpo(row.get("cliente")),
             "uf": "",
             "prazo_meses": None,
@@ -450,16 +529,21 @@ def migrar_referencias_historicas_para_pricing():
             "vendedor": texto_limpo(row.get("vendedor")),
             "gerente": texto_limpo(row.get("gerente")),
             "representante": "",
-            "nota_fiscal": texto_limpo(row.get("nota_fiscal")),
-            "contrato": texto_limpo(row.get("identificador")) if not faturada else "",
+            "nota_fiscal": texto_limpo(
+                row.get("nota_fiscal")
+            ),
+            "contrato": (
+                texto_limpo(row.get("identificador"))
+                if not faturada
+                else ""
+            ),
             "simulacao_id": None,
-            "observacao": texto_limpo(row.get("observacao")),
+            "observacao": texto_limpo(
+                row.get("observacao")
+            ),
         })
-        if ref_id:
-            inseridos += 1
-        else:
-            ignorados += 1
-    return {"inseridos": inseridos, "ignorados": ignorados}
+
+    return salvar_referencias_preco_lote(registros)
 
 
 def migrar_simulacoes_para_pricing():
@@ -467,59 +551,183 @@ def migrar_simulacoes_para_pricing():
     if sims.empty:
         return {"inseridos": 0, "ignorados": 0}
 
-    inseridos = ignorados = 0
+    registros = []
+
     for _, row in sims.iterrows():
         try:
-            detalhes = json.loads(row.get("detalhes") or "{}")
+            detalhes = json.loads(
+                row.get("detalhes") or "{}"
+            )
         except Exception:
             detalhes = {}
-        status = detalhes.get("status_referencia", "Rascunho")
-        ref_id = salvar_referencia_preco({
-            "chave_unica": f"SIMULACAO|{int(row['id'])}",
-            "data_referencia": texto_limpo(row.get("data_hora")),
+
+        status = detalhes.get(
+            "status_referencia",
+            "Rascunho",
+        )
+
+        registros.append({
+            "chave_unica": (
+                f"SIMULACAO|{int(row['id'])}"
+            ),
+            "data_referencia": texto_limpo(
+                row.get("data_hora")
+            ),
             "fonte": "Simulação interna",
             "tipo_fonte": "Simulação",
-            "confianca_pct": confianca_referencia("Simulação interna", status),
+            "confianca_pct": confianca_referencia(
+                "Simulação interna",
+                status,
+            ),
             "status": status,
-            "equipamento_codigo": detalhes.get("equipamento_codigo", ""),
-            "equipamento": texto_limpo(row.get("equipamento")),
-            "fabricante": texto_limpo(row.get("fabricante")),
-            "linha_produto": detalhes.get("linha_produto", ""),
-            "condicao": texto_limpo(row.get("tipo")),
-            "origem_produto": detalhes.get("origem_produto", "Não informado"),
-            "cliente_codigo": detalhes.get("cliente_codigo", ""),
-            "cliente": texto_limpo(row.get("cliente")),
+            "equipamento_codigo": detalhes.get(
+                "equipamento_codigo",
+                "",
+            ),
+            "equipamento": texto_limpo(
+                row.get("equipamento")
+            ),
+            "fabricante": texto_limpo(
+                row.get("fabricante")
+            ),
+            "linha_produto": detalhes.get(
+                "linha_produto",
+                "",
+            ),
+            "condicao": texto_limpo(
+                row.get("tipo")
+            ),
+            "origem_produto": detalhes.get(
+                "origem_produto",
+                "Não informado",
+            ),
+            "cliente_codigo": detalhes.get(
+                "cliente_codigo",
+                "",
+            ),
+            "cliente": texto_limpo(
+                row.get("cliente")
+            ),
             "uf": detalhes.get("uf", ""),
-            "prazo_meses": int(row.get("prazo") or 0),
-            "quantidade": detalhes.get("quantidade", 1.0),
-            "preco_mensal_unitario": numero_limpo(row.get("aluguel")),
-            "valor_mensal_total": numero_limpo(row.get("aluguel")),
-            "valor_investimento": numero_limpo(row.get("investimento")),
-            "aluguel_minimo_calculado": numero_limpo(row.get("aluguel_minimo")),
-            "margem_pct": numero_limpo(row.get("margem")),
-            "payback_meses": numero_limpo(row.get("payback")),
-            "vendedor": texto_limpo(row.get("responsavel")),
+            "prazo_meses": int(
+                row.get("prazo") or 0
+            ),
+            "quantidade": detalhes.get(
+                "quantidade",
+                1.0,
+            ),
+            "preco_mensal_unitario": numero_limpo(
+                row.get("aluguel")
+            ),
+            "valor_mensal_total": numero_limpo(
+                row.get("aluguel")
+            ),
+            "valor_investimento": numero_limpo(
+                row.get("investimento")
+            ),
+            "aluguel_minimo_calculado": numero_limpo(
+                row.get("aluguel_minimo")
+            ),
+            "margem_pct": numero_limpo(
+                row.get("margem")
+            ),
+            "payback_meses": numero_limpo(
+                row.get("payback")
+            ),
+            "vendedor": texto_limpo(
+                row.get("responsavel")
+            ),
             "gerente": "",
             "representante": "",
             "nota_fiscal": "",
             "contrato": "",
             "simulacao_id": int(row.get("id")),
-            "observacao": detalhes.get("observacao_referencia", ""),
+            "observacao": detalhes.get(
+                "observacao_referencia",
+                "",
+            ),
         })
-        if ref_id:
-            inseridos += 1
-        else:
-            ignorados += 1
-    return {"inseridos": inseridos, "ignorados": ignorados}
+
+    return salvar_referencias_preco_lote(registros)
 
 
-def sincronizar_central_pricing():
+def contar_registros_tabela(tabela):
+    tabelas_permitidas = {
+        "referencias_historicas",
+        "referencias_preco",
+        "historico_v17",
+    }
+    if tabela not in tabelas_permitidas:
+        raise ValueError("Tabela não autorizada.")
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        return int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM {tabela}"
+            ).fetchone()[0]
+        )
+    except Exception:
+        return 0
+    finally:
+        conn.close()
+
+
+def sincronizar_central_pricing(forcar=False):
+    legadas = contar_registros_tabela(
+        "referencias_historicas"
+    )
+    simulacoes = contar_registros_tabela(
+        "historico_v17"
+    )
+    pricing = contar_registros_tabela(
+        "referencias_preco"
+    )
+
+    # Depois da primeira migração, as novas simulações já são
+    # incluídas diretamente na tabela de pricing.
+    precisa_migrar = (
+        forcar
+        or pricing == 0
+        or pricing < (legadas + simulacoes)
+    )
+
+    if not precisa_migrar:
+        return {
+            "inseridos": 0,
+            "ignorados": 0,
+            "status": "Sem alterações",
+        }
+
     r1 = migrar_referencias_historicas_para_pricing()
     r2 = migrar_simulacoes_para_pricing()
+
     return {
-        "inseridos": r1["inseridos"] + r2["inseridos"],
-        "ignorados": r1["ignorados"] + r2["ignorados"],
+        "inseridos": (
+            r1["inseridos"]
+            + r2["inseridos"]
+        ),
+        "ignorados": (
+            r1["ignorados"]
+            + r2["ignorados"]
+        ),
+        "status": "Sincronizada",
     }
+
+
+@st.cache_resource(show_spinner=False)
+def inicializar_bases_pricing():
+    """Executa as rotinas pesadas somente uma vez por processo."""
+    status_base = sincronizar_base_bi_git()
+
+    # A migração só é necessária quando a base mudou ou quando
+    # ainda não há referências consolidadas.
+    forcar = status_base.get("status") == "Importada"
+    status_pricing = sincronizar_central_pricing(
+        forcar=forcar
+    )
+
+    return status_base, status_pricing
 
 
 def percentil_ponderado(valores, pesos, quantil):
@@ -790,12 +998,24 @@ def localizar_base_bi_git():
     return None
 
 
-def hash_sha256_arquivo(caminho):
+@st.cache_data(show_spinner=False)
+def _hash_sha256_cache(caminho_str, tamanho, mtime_ns):
+    """Calcula o hash apenas uma vez por versão física do arquivo."""
     digest = hashlib.sha256()
-    with open(caminho, "rb") as arquivo:
+    with open(caminho_str, "rb") as arquivo:
         for bloco in iter(lambda: arquivo.read(1024 * 1024), b""):
             digest.update(bloco)
     return digest.hexdigest()
+
+
+def hash_sha256_arquivo(caminho):
+    caminho = Path(caminho)
+    stat = caminho.stat()
+    return _hash_sha256_cache(
+        str(caminho.resolve()),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+    )
 
 
 def consultar_importacao_por_hash(hash_arquivo):
@@ -1817,8 +2037,9 @@ def gerar_proposta_pdf(
 # ======================================================
 # SINCRONIZAÇÃO AUTOMÁTICA DA BASE HISTÓRICA DO GIT
 # ======================================================
-status_base_bi_git = sincronizar_base_bi_git()
-status_central_pricing = sincronizar_central_pricing()
+status_base_bi_git, status_central_pricing = (
+    inicializar_bases_pricing()
+)
 
 # ======================================================
 # MENU
@@ -1863,6 +2084,20 @@ with st.sidebar.expander("Base histórica no Git", expanded=False):
         st.caption(
             f"Arquivo: {Path(status_base_bi_git['caminho']).name}"
         )
+
+    st.caption(
+        f"Central de pricing: "
+        f"{status_central_pricing.get('status', 'OK')}"
+    )
+
+    if st.button(
+        "Sincronizar histórico agora",
+        use_container_width=True,
+        key="sincronizar_historico_manual",
+    ):
+        _hash_sha256_cache.clear()
+        inicializar_bases_pricing.clear()
+        st.rerun()
 
 if st.sidebar.button("Limpar rascunho da aba atual", use_container_width=True):
     _prefix = f"draft__{_slug_widget(menu)}__"
