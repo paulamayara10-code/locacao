@@ -3,6 +3,7 @@ import json
 import re
 import sqlite3
 import hashlib
+from io import BytesIO
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -935,6 +936,106 @@ def normalizar_texto_coluna(valor):
     texto=str(valor or '').strip().upper()
     mapa=str.maketrans('ÁÀÃÂÉÊÍÓÔÕÚÇ','AAAAEEIOOOUC')
     return re.sub(r'\s+',' ',texto.translate(mapa))
+
+
+SUFIXOS_VARIACAO_EQUIPAMENTO = {
+    "RV",
+    "TC",
+    "DEMO",
+    "TESTE",
+    "LOC",
+    "LOCACAO",
+}
+
+
+def normalizar_codigo_equipamento(valor):
+    """Cria o código-base usado para agrupar variações do mesmo item.
+
+    Exemplos:
+    E360, E360_01, E360_RV e E360_TC passam a ser E360.
+
+    A remoção numérica é conservadora: considera apenas sufixos
+    iniciados por zero, como _01, _02 ou _001, evitando alterar
+    códigos em que o número após o separador faça parte do modelo.
+    """
+    texto = normalizar_texto_coluna(valor)
+
+    if not texto:
+        return ""
+
+    # Corrige códigos numéricos que vieram do Excel como 123.0.
+    if re.fullmatch(r"\d+\.0", texto):
+        texto = texto[:-2]
+
+    texto = re.sub(r"[\s/\\-]+", "_", texto)
+    texto = re.sub(r"_+", "_", texto).strip("_")
+
+    while texto:
+        partes = texto.split("_")
+        if len(partes) <= 1:
+            break
+
+        sufixo = partes[-1]
+        sufixo_numerico = bool(
+            re.fullmatch(r"0\d{1,2}", sufixo)
+        )
+        sufixo_conhecido = (
+            sufixo in SUFIXOS_VARIACAO_EQUIPAMENTO
+        )
+
+        if not (sufixo_numerico or sufixo_conhecido):
+            break
+
+        texto = "_".join(partes[:-1]).strip("_")
+
+    return texto
+
+
+def normalizar_nome_equipamento(valor):
+    """Agrupa nomes que diferem somente por sufixos operacionais."""
+    texto = normalizar_texto_coluna(valor)
+
+    if not texto:
+        return ""
+
+    # Mantém a descrição legível, mas normaliza separadores finais.
+    texto = re.sub(r"[\s/\\-]+", "_", texto)
+    texto = re.sub(r"_+", "_", texto).strip("_")
+
+    while texto:
+        partes = texto.split("_")
+        if len(partes) <= 1:
+            break
+
+        sufixo = partes[-1]
+        if (
+            re.fullmatch(r"0\d{1,2}", sufixo)
+            or sufixo in SUFIXOS_VARIACAO_EQUIPAMENTO
+        ):
+            texto = "_".join(partes[:-1]).strip("_")
+        else:
+            break
+
+    return texto
+
+
+def chave_agrupamento_equipamento(codigo, equipamento):
+    codigo_base = normalizar_codigo_equipamento(codigo)
+    if codigo_base:
+        return f"COD|{codigo_base}"
+
+    nome_base = normalizar_nome_equipamento(equipamento)
+    return f"DESC|{nome_base}" if nome_base else ""
+
+
+def texto_mais_frequente(valores):
+    serie = pd.Series(valores).fillna("").astype(str).str.strip()
+    serie = serie[serie.ne("")]
+    if serie.empty:
+        return ""
+    moda = serie.mode()
+    return str(moda.iloc[0] if not moda.empty else serie.iloc[0])
+
 
 def localizar_coluna(df, possibilidades):
     mapa={normalizar_texto_coluna(c):c for c in df.columns}
@@ -2641,6 +2742,26 @@ elif menu == "1 - Central de Consulta":
     )
 
     refs = referencias_preco()
+
+    if not refs.empty:
+        refs["_codigo_base"] = (
+            refs["equipamento_codigo"]
+            .fillna("")
+            .map(normalizar_codigo_equipamento)
+        )
+        refs["_equipamento_base"] = (
+            refs["equipamento"]
+            .fillna("")
+            .map(normalizar_nome_equipamento)
+        )
+        refs["_chave_equipamento"] = refs.apply(
+            lambda linha: chave_agrupamento_equipamento(
+                linha.get("equipamento_codigo", ""),
+                linha.get("equipamento", ""),
+            ),
+            axis=1,
+        )
+
     if refs.empty:
         if status_base_bi_git.get("status") == "Ausente":
             st.warning(
@@ -2700,11 +2821,22 @@ elif menu == "1 - Central de Consulta":
             termo = normalizar_texto_coluna(busca)
             mascara = pd.Series(False, index=candidatos.index)
             for coluna_busca in [
-                "equipamento_codigo", "equipamento", "fabricante", "linha_produto"
+                "equipamento_codigo",
+                "equipamento",
+                "fabricante",
+                "linha_produto",
+                "_codigo_base",
+                "_equipamento_base",
             ]:
-                mascara |= candidatos[coluna_busca].fillna("").map(
-                    normalizar_texto_coluna
-                ).str.contains(re.escape(termo), na=False)
+                mascara |= (
+                    candidatos[coluna_busca]
+                    .fillna("")
+                    .map(normalizar_texto_coluna)
+                    .str.contains(
+                        re.escape(termo),
+                        na=False,
+                    )
+                )
             candidatos = candidatos[mascara]
         if condicoes:
             cond_series = candidatos["condicao"].fillna("").replace("", "Não informado")
@@ -2714,40 +2846,116 @@ elif menu == "1 - Central de Consulta":
             st.warning("Nenhuma referência encontrada para a pesquisa.")
         else:
             agrupados = (
-                candidatos.assign(
-                    _codigo=candidatos["equipamento_codigo"].fillna(""),
-                    _equip=candidatos["equipamento"].fillna(""),
+                candidatos[
+                    candidatos["_chave_equipamento"].fillna("").ne("")
+                ]
+                .groupby(
+                    "_chave_equipamento",
+                    dropna=False,
                 )
-                .groupby(["_codigo", "_equip"], dropna=False)
-                .size()
-                .reset_index(name="referencias")
-                .sort_values(["referencias", "_equip"], ascending=[False, True])
+                .agg(
+                    codigo_base=(
+                        "_codigo_base",
+                        texto_mais_frequente,
+                    ),
+                    equipamento=(
+                        "equipamento",
+                        texto_mais_frequente,
+                    ),
+                    referencias=(
+                        "_chave_equipamento",
+                        "size",
+                    ),
+                    variacoes_codigo=(
+                        "equipamento_codigo",
+                        lambda serie: int(
+                            pd.Series(serie)
+                            .fillna("")
+                            .astype(str)
+                            .str.strip()
+                            .replace("", np.nan)
+                            .dropna()
+                            .nunique()
+                        ),
+                    ),
+                )
+                .reset_index()
+                .sort_values(
+                    ["referencias", "equipamento"],
+                    ascending=[False, True],
+                )
             )
+
             opcoes = []
             mapa_opcoes = {}
+
             for _, item in agrupados.iterrows():
-                codigo = texto_limpo(item["_codigo"])
-                equip = texto_limpo(item["_equip"])
-                label = " | ".join([p for p in [codigo, equip] if p])
-                label = f"{label} ({int(item['referencias'])} referências)"
+                codigo = texto_limpo(
+                    item["codigo_base"]
+                )
+                equip = texto_limpo(
+                    item["equipamento"]
+                )
+                label_base = " | ".join(
+                    [
+                        parte
+                        for parte in [codigo, equip]
+                        if parte
+                    ]
+                )
+
+                detalhes_label = (
+                    f"{int(item['referencias'])} referências"
+                )
+                if int(item["variacoes_codigo"]) > 1:
+                    detalhes_label += (
+                        f"; {int(item['variacoes_codigo'])} "
+                        "códigos agrupados"
+                    )
+
+                label = (
+                    f"{label_base} ({detalhes_label})"
+                )
                 opcoes.append(label)
-                mapa_opcoes[label] = (codigo, equip)
+                mapa_opcoes[label] = (
+                    item["_chave_equipamento"],
+                    codigo,
+                    equip,
+                )
 
             escolha = st.selectbox(
                 "Equipamento para análise",
                 opcoes,
                 key="central_equipamento_selecionado",
             )
-            codigo_sel, equipamento_sel = mapa_opcoes[escolha]
-            if codigo_sel:
-                base_equip = refs[
-                    refs["equipamento_codigo"].fillna("").eq(codigo_sel)
-                ].copy()
-            else:
-                base_equip = refs[
-                    refs["equipamento"].fillna("").map(normalizar_texto_coluna)
-                    .eq(normalizar_texto_coluna(equipamento_sel))
-                ].copy()
+
+            (
+                chave_equipamento_sel,
+                codigo_sel,
+                equipamento_sel,
+            ) = mapa_opcoes[escolha]
+
+            base_equip = refs[
+                refs["_chave_equipamento"].eq(
+                    chave_equipamento_sel
+                )
+            ].copy()
+
+            variacoes = sorted(
+                {
+                    texto_limpo(valor)
+                    for valor in base_equip[
+                        "equipamento_codigo"
+                    ].tolist()
+                    if texto_limpo(valor)
+                }
+            )
+
+            if len(variacoes) > 1:
+                st.caption(
+                    "Códigos reunidos nesta análise: "
+                    + ", ".join(variacoes)
+                )
 
             col1, col2, col3 = st.columns(3)
             fontes_disp = sorted(base_equip["tipo_fonte"].dropna().unique().tolist())
@@ -2790,7 +2998,10 @@ elif menu == "1 - Central de Consulta":
                 min_value=0.0,
                 value=float(minimo_padrao),
                 step=100.0,
-                key=f"central_minimo_{_slug_widget(codigo_sel or equipamento_sel)}",
+                key=(
+                    "central_minimo_"
+                    f"{_slug_widget(chave_equipamento_sel)}"
+                ),
             )
 
             analise = analisar_referencias_preco(view, aluguel_minimo_atual)
@@ -4224,6 +4435,10 @@ elif menu == "6 - Configurações de Cálculo":
             ["Dólar para importação", "Cotação de venda do Banco Central, com edição permitida"],
             ["Referência histórica", "Somente linhas em que a coluna NOVA esteja como LOCAÇÃO"],
             ["Preço histórico", "VALOR BRUTO total dividido pela quantidade faturada"],
+            [
+                "Variações do equipamento",
+                "Sufixos como _01, _RV e _TC são reunidos no mesmo código-base",
+            ],
             ["Comissões", "Vendedor, gerente e representante podem ser somados"],
             ["Comissão inicial do vendedor", "5,00%"],
             ["Comissão inicial do gerente", "0,50%"],
