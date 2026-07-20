@@ -142,6 +142,8 @@ COMISSAO_VENDEDOR = 5.00
 COMISSAO_GERENTE = 0.50
 COMISSAO_REPRESENTANTE = 14.00
 MARGEM_PADRAO = 25.00
+MARGEM_USADO_PADRAO = 30.00
+RESERVA_RISCO_USADO_PADRAO = 10.00
 TAXA_FINANCIAMENTO = 1.60
 PRAZO_FINANCIAMENTO = 36
 VIDA_UTIL_PADRAO = 10.0
@@ -170,6 +172,15 @@ section[data-testid="stSidebar"] *{color:white!important}
 .metric-help{color:#64748B;font-size:.84rem;margin-top:6px}
 .section-title{color:#0B2F4A;font-size:1.18rem;font-weight:850;margin:16px 0 10px}
 .parecer{background:#fff;border-left:6px solid #D7A84F;padding:18px 20px;border-radius:16px;box-shadow:0 8px 24px rgba(15,46,74,.07);color:#0B2F4A;line-height:1.55;margin:12px 0 18px}
+.resultado-fixo{position:sticky;top:.5rem;z-index:80;background:rgba(255,255,255,.97);backdrop-filter:blur(10px);border:1px solid rgba(15,46,74,.12);border-radius:18px;padding:12px 16px;box-shadow:0 10px 30px rgba(15,46,74,.14);margin:0 0 14px}
+.resultado-fixo-titulo{font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;font-weight:850;color:#64748B;margin-bottom:8px}
+.resultado-fixo-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}
+.resultado-fixo-item{border-right:1px solid #E5E7EB;padding-right:10px}
+.resultado-fixo-item:last-child{border-right:0}
+.resultado-fixo-label{font-size:.70rem;color:#64748B;text-transform:uppercase;font-weight:750}
+.resultado-fixo-valor{font-size:1.05rem;color:#0B2F4A;font-weight:900;margin-top:3px}
+.resultado-fixo-alerta{margin-top:8px;font-size:.82rem;color:#8A4B08;font-weight:750}
+@media(max-width:900px){.resultado-fixo-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.resultado-fixo-item{border-right:0}}
 .stButton>button,.stDownloadButton>button{border-radius:14px!important;border:0!important;background:linear-gradient(135deg,#0B2F4A,#155E75)!important;color:white!important;font-weight:800!important;padding:.75rem 1rem!important}
 </style>
 """,
@@ -1037,6 +1048,90 @@ def texto_mais_frequente(valores):
     return str(moda.iloc[0] if not moda.empty else serie.iloc[0])
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def carregar_referencias_para_cotacao():
+    return referencias_preco()
+
+
+def buscar_preco_historico_equipamento(
+    codigo="",
+    equipamento="",
+    termo="",
+):
+    refs = carregar_referencias_para_cotacao()
+
+    if refs.empty:
+        return pd.DataFrame(), "", []
+
+    refs = refs.copy()
+    refs["_codigo_base"] = (
+        refs["equipamento_codigo"]
+        .fillna("")
+        .map(normalizar_codigo_equipamento)
+    )
+    refs["_equipamento_base"] = (
+        refs["equipamento"]
+        .fillna("")
+        .map(normalizar_nome_equipamento)
+    )
+    refs["_chave_equipamento"] = refs.apply(
+        lambda linha: chave_agrupamento_equipamento(
+            linha.get("equipamento_codigo", ""),
+            linha.get("equipamento", ""),
+        ),
+        axis=1,
+    )
+
+    chave_alvo = chave_agrupamento_equipamento(
+        codigo,
+        equipamento,
+    )
+
+    if chave_alvo:
+        base = refs[
+            refs["_chave_equipamento"].eq(chave_alvo)
+        ].copy()
+    else:
+        termo_n = normalizar_texto_coluna(termo)
+        if not termo_n:
+            return pd.DataFrame(), "", []
+
+        mascara = (
+            refs["_codigo_base"]
+            .fillna("")
+            .map(normalizar_texto_coluna)
+            .str.contains(re.escape(termo_n), na=False)
+            |
+            refs["_equipamento_base"]
+            .fillna("")
+            .map(normalizar_texto_coluna)
+            .str.contains(re.escape(termo_n), na=False)
+        )
+        candidatos = refs[mascara].copy()
+
+        if candidatos.empty:
+            return pd.DataFrame(), "", []
+
+        chave_alvo = (
+            candidatos["_chave_equipamento"]
+            .value_counts()
+            .index[0]
+        )
+        base = candidatos[
+            candidatos["_chave_equipamento"].eq(chave_alvo)
+        ].copy()
+
+    variacoes = sorted(
+        {
+            texto_limpo(valor)
+            for valor in base["equipamento_codigo"].tolist()
+            if texto_limpo(valor)
+        }
+    )
+
+    return base, chave_alvo, variacoes
+
+
 def localizar_coluna(df, possibilidades):
     mapa={normalizar_texto_coluna(c):c for c in df.columns}
     for p in possibilidades:
@@ -1801,33 +1896,33 @@ def calcular_depreciacao(valor, data_aquisicao, data_inicio, prazo, vida_anos):
 
 
 def taxa_manutencao_por_depreciacao(depreciacao_atual_pct):
-    """Curva gerencial inicial de manutenção anual sobre o valor de aquisição.
+    """Reserva anual de manutenção para equipamentos usados.
 
-    Quanto mais depreciado/antigo o ativo, maior a reserva de manutenção.
-    As faixas são premissas iniciais e permanecem editáveis no formulário.
+    A curva é deliberadamente conservadora para evitar preços muito baixos.
+    Todos os percentuais permanecem editáveis na cotação.
     """
     if depreciacao_atual_pct <= 20:
-        return 2.0
+        return 4.0
     if depreciacao_atual_pct <= 40:
-        return 3.0
+        return 6.0
     if depreciacao_atual_pct <= 60:
-        return 5.0
+        return 8.0
     if depreciacao_atual_pct <= 80:
-        return 7.0
-    return 10.0
+        return 12.0
+    return 15.0
 
 
 def horas_tecnicas_por_depreciacao(depreciacao_atual_pct):
-    """Estimativa inicial de horas técnicas mensais."""
+    """Estimativa conservadora de horas técnicas mensais."""
     if depreciacao_atual_pct <= 20:
-        return 1.0
-    if depreciacao_atual_pct <= 40:
         return 2.0
-    if depreciacao_atual_pct <= 60:
+    if depreciacao_atual_pct <= 40:
         return 3.0
-    if depreciacao_atual_pct <= 80:
+    if depreciacao_atual_pct <= 60:
         return 4.0
-    return 6.0
+    if depreciacao_atual_pct <= 80:
+        return 6.0
+    return 8.0
 
 
 def simulacao_base_usado(
@@ -1838,8 +1933,8 @@ def simulacao_base_usado(
     vida_util=10.0,
     imposto_pct=IMPOSTO_ATUAL,
     comissao_pct=COMISSAO_VENDEDOR + COMISSAO_GERENTE,
-    margem_pct=MARGEM_PADRAO,
-    reserva_risco_pct=5.0,
+    margem_pct=MARGEM_USADO_PADRAO,
+    reserva_risco_pct=RESERVA_RISCO_USADO_PADRAO,
 ):
     """Gera uma referência de manutenção e aluguel para o ativo usado."""
     dep_atual = calcular_depreciacao(
@@ -2214,7 +2309,7 @@ def gerar_proposta_pdf(
         canvas.drawRightString(
             largura - margem,
             altura - 11 * mm,
-            "Proposta de Locação",
+            "Análise interna de locação",
         )
 
         # Rodapé
@@ -2263,19 +2358,22 @@ def gerar_proposta_pdf(
 
     story.append(
         Paragraph(
-            f"Proposta de Locação - Equipamento {texto_pdf(tipo)}",
+            f"Formação Interna de Preço - Equipamento {texto_pdf(tipo)}",
             estilos["FirstTitle"],
         )
     )
     story.append(
         Paragraph(
-            f"Validade da proposta: {validade.strftime('%d/%m/%Y')}",
+            (
+                f"Validade da análise: {validade.strftime('%d/%m/%Y')} | "
+                "Documento interno sujeito à aprovação da gerência"
+            ),
             estilos["FirstSub"],
         )
     )
     story.append(Spacer(1, 7 * mm))
 
-    story.append(Paragraph("Dados da proposta", estilos["Section"]))
+    story.append(Paragraph("Dados da análise", estilos["Section"]))
 
     dados = [
         ["Cliente", texto_pdf(cliente or "Não informado")],
@@ -2457,8 +2555,14 @@ def gerar_proposta_pdf(
     assinaturas = Table(
         [
             ["", ""],
-            ["FIRST MEDICAL", texto_pdf(cliente or "CLIENTE")],
-            ["Responsável comercial", "Aceite do cliente"],
+            [
+                texto_pdf(responsavel or "RESPONSÁVEL PELA ANÁLISE"),
+                "GERÊNCIA",
+            ],
+            [
+                "Elaborado por",
+                "Aval e liberação do preço",
+            ],
         ],
         colWidths=[82 * mm, 82 * mm],
     )
@@ -3492,10 +3596,10 @@ elif menu == "2 - Formação de Preço - Novos":
         col1, col2 = st.columns(2)
         with col1:
             st.download_button(
-                "Baixar proposta em PDF",
+                "Baixar análise interna em PDF",
                 data=proposta_pdf_novo,
                 file_name=(
-                    f"proposta_locacao_novo_"
+                    f"analise_interna_locacao_novo_"
                     f"{_slug_widget(cliente or equipamento or 'cliente')}.pdf"
                 ),
                 mime="application/pdf",
@@ -3602,6 +3706,8 @@ elif menu == "3 - Formação de Preço - Usados":
         unsafe_allow_html=True,
     )
 
+    resumo_final_usado = st.container()
+
     ativos = carregar_ativos()
     info = {}
 
@@ -3641,6 +3747,94 @@ elif menu == "3 - Formação de Preço - Usados":
                 f"Data: {info['data_aquisicao'] or 'não informada'}"
             )
 
+    assinatura_busca_historica = (
+        f"{info.get('codigo', '')}|"
+        f"{info.get('equipamento', '')}"
+    )
+    if (
+        info
+        and st.session_state.get("_assinatura_busca_usado")
+        != assinatura_busca_historica
+    ):
+        st.session_state["_assinatura_busca_usado"] = (
+            assinatura_busca_historica
+        )
+        st.session_state["usado_busca_historico"] = (
+            info.get("codigo")
+            or info.get("equipamento", "")
+        )
+
+    termo_historico_usado = st.text_input(
+        "Consultar preço já praticado",
+        key="usado_busca_historico",
+        placeholder="Digite o código ou nome do equipamento",
+        help=(
+            "A consulta reúne códigos equivalentes, como E360, "
+            "E360_01, E360_RV e E360_TC."
+        ),
+    )
+
+    base_historica_usado, chave_historica_usado, variacoes_historicas = (
+        buscar_preco_historico_equipamento(
+            codigo=info.get("codigo", ""),
+            equipamento=info.get("equipamento", ""),
+            termo=termo_historico_usado,
+        )
+    )
+    analise_historica_usado = analisar_referencias_preco(
+        base_historica_usado,
+        0.0,
+    )
+
+    preco_historico_sugerido = 0.0
+    if analise_historica_usado["quantidade"] > 0:
+        preco_historico_sugerido = (
+            analise_historica_usado["preco_premium"]
+            if analise_historica_usado["quantidade"] >= 3
+            else analise_historica_usado["preco_recomendado"]
+        )
+
+        st.markdown(
+            '<div class="section-title">Preços já praticados</div>',
+            unsafe_allow_html=True,
+        )
+        col_hist = st.columns(4)
+        with col_hist[0]:
+            card(
+                "Último preço",
+                moeda(analise_historica_usado["ultimo"]),
+                "Faturamento mais recente",
+            )
+        with col_hist[1]:
+            card(
+                "Preço mediano",
+                moeda(analise_historica_usado["mediana"]),
+                "Referências comparáveis",
+            )
+        with col_hist[2]:
+            card(
+                "Faixa alta sugerida",
+                moeda(preco_historico_sugerido),
+                "Referência usada na cotação",
+            )
+        with col_hist[3]:
+            card(
+                "Base consultada",
+                str(analise_historica_usado["quantidade"]),
+                f"Confiança {analise_historica_usado['confianca']}",
+            )
+
+        if len(variacoes_historicas) > 1:
+            st.caption(
+                "Códigos reunidos: "
+                + ", ".join(variacoes_historicas)
+            )
+    elif termo_historico_usado:
+        st.info(
+            "Não foram encontrados preços faturados para este equipamento. "
+            "A sugestão será formada somente pelos custos da operação."
+        )
+
     # Gera valores-base quando um ativo é selecionado.
     simulacao_inicial = None
     if info and info.get("valor", 0) > 0:
@@ -3656,10 +3850,16 @@ elif menu == "3 - Formação de Preço - Usados":
             vida_util=VIDA_UTIL_PADRAO,
         )
 
+        sugestao_integrada_usado = max(
+            float(simulacao_inicial["aluguel_sugerido"]),
+            float(preco_historico_sugerido),
+        )
+
         assinatura_ativo = (
             f"{info.get('codigo', '')}|"
             f"{info.get('valor', 0)}|"
-            f"{info.get('data_aquisicao', '')}"
+            f"{info.get('data_aquisicao', '')}|"
+            f"{preco_historico_sugerido:.2f}"
         )
 
         # Valores-base são usados como padrão dos campos.
@@ -3670,7 +3870,7 @@ elif menu == "3 - Formação de Preço - Usados":
                 simulacao_inicial["manutencao_mensal"]
             )
             st.session_state["_base_aluguel_usado"] = float(
-                simulacao_inicial["aluguel_sugerido"]
+                sugestao_integrada_usado
             )
             st.session_state["_base_horas_usado"] = float(
                 simulacao_inicial["horas_tecnicas"]
@@ -3704,9 +3904,9 @@ elif menu == "3 - Formação de Preço - Usados":
             )
         with cols_base[3]:
             card(
-                "Aluguel-base sugerido",
-                moeda(simulacao_inicial["aluguel_sugerido"]),
-                "24 meses, margem de 25%",
+                "Sugestão integrada",
+                moeda(sugestao_integrada_usado),
+                "Maior entre cálculo e histórico",
             )
 
     with st.form("usados"):
@@ -3889,10 +4089,10 @@ elif menu == "3 - Formação de Preço - Usados":
         reserva_risco_pct = col3.number_input(
             "Reserva técnica / indisponibilidade (%)",
             0.0,
-            value=5.0,
+            value=RESERVA_RISCO_USADO_PADRAO,
             step=0.5,
             help=(
-                "Reserva gerencial sobre os custos operacionais "
+                "Reserva sobre os custos operacionais "
                 "para falhas, indisponibilidade e substituições."
             ),
         )
@@ -3908,7 +4108,12 @@ elif menu == "3 - Formação de Preço - Usados":
                 "Custos + depreciação do contrato",
                 "Custos + valor contábil integral",
             ],
+            index=1,
             horizontal=True,
+            help=(
+                "A opção inicial recupera a perda de valor do equipamento "
+                "durante o período da locação."
+            ),
         )
 
         st.markdown(
@@ -3957,7 +4162,7 @@ elif menu == "3 - Formação de Preço - Usados":
             vida_util=vida_util,
             imposto_pct=IMPOSTO_ATUAL,
             comissao_pct=com_pct,
-            margem_pct=MARGEM_PADRAO,
+            margem_pct=MARGEM_USADO_PADRAO,
             reserva_risco_pct=reserva_risco_pct,
         )
         aluguel_base_form = simulacao_form["aluguel_sugerido"]
@@ -3978,7 +4183,7 @@ elif menu == "3 - Formação de Preço - Usados":
         margem = col2.number_input(
             "Margem desejada (%)",
             0.0,
-            value=MARGEM_PADRAO,
+            value=MARGEM_USADO_PADRAO,
             step=1.0,
         )
         imposto = col3.number_input(
@@ -4061,15 +4266,15 @@ elif menu == "3 - Formação de Preço - Usados":
         if modelo_usado == "Somente custos incrementais":
             investimento_recuperar = 0.0
         elif modelo_usado == "Custos + depreciação do contrato":
-            depreciacao_no_contrato = min(
-                valor_ativo / (vida_util * 12) * prazo,
-                dep["valor_contabil"]
-                + min(
-                    valor_ativo / (vida_util * 12) * prazo,
-                    valor_ativo,
-                ),
+            depreciacao_no_contrato = max(
+                dep["depreciacao"]
+                - dep_atual_form["depreciacao"],
+                0.0,
             )
-            investimento_recuperar = depreciacao_no_contrato
+            investimento_recuperar = min(
+                depreciacao_no_contrato,
+                dep_atual_form["valor_contabil"],
+            )
         else:
             investimento_recuperar = dep["valor_contabil"]
 
@@ -4104,116 +4309,179 @@ elif menu == "3 - Formação de Preço - Usados":
             demais_custos_reforma,
         )
 
-        st.markdown(
-            '<div class="section-title">Resumo executivo</div>',
-            unsafe_allow_html=True,
+        preco_referencia_final = max(
+            float(preco_historico_sugerido),
+            float(atual["aluguel_minimo"]),
         )
-        cards = [
-            (
-                "Aluguel mínimo",
-                moeda(atual["aluguel_minimo"]),
-                f"Margem {perc(margem)}",
-            ),
-            (
-                "Custo mensal operacional",
-                moeda(custo_mensal),
-                "Manutenção + técnico + outros",
-            ),
-            (
-                "Lucro atual",
-                moeda(atual["lucro"]),
-                "Com aluguel informado",
-            ),
-            (
-                "Payback",
-                meses(atual["payback"]),
-                modelo_usado,
-            ),
-        ]
-        cols = st.columns(4)
-        for c, item in zip(cols, cards):
-            with c:
-                card(*item)
 
-        st.markdown(
-            '<div class="section-title">Depreciação e ativo</div>',
-            unsafe_allow_html=True,
-        )
-        cards = [
-            (
-                "Meses já depreciados",
-                f"{dep['meses_antes']} meses",
-                "Antes do contrato",
-            ),
-            (
-                "Taxa de depreciação",
-                perc(dep["taxa"]),
-                f"{dep['meses_finais']} meses totais",
-            ),
-            (
-                "Valor contábil final",
-                moeda(dep["valor_contabil"]),
-                "Após o contrato",
-            ),
-            (
-                "Capital recuperado",
-                moeda(investimento_recuperar),
-                modelo_usado,
-            ),
-        ]
-        cols = st.columns(4)
-        for c, item in zip(cols, cards):
-            with c:
-                card(*item)
+        alerta_preco = ""
+        if aluguel < atual["aluguel_minimo"]:
+            alerta_preco = (
+                "O aluguel informado está abaixo do mínimo calculado."
+            )
+        elif (
+            preco_historico_sugerido > 0
+            and aluguel < preco_historico_sugerido
+        ):
+            alerta_preco = (
+                "O aluguel informado está abaixo da faixa histórica sugerida."
+            )
+        else:
+            alerta_preco = (
+                "O valor informado está compatível com o cálculo e "
+                "as referências disponíveis."
+            )
 
-        st.markdown(
-            '<div class="section-title">Atual x pós-reforma</div>',
-            unsafe_allow_html=True,
-        )
-        cards = [
-            (
-                "Impostos atuais",
-                moeda(atual["impostos"]),
-                "14,30%",
-            ),
-            (
-                "IBS/CBS bruto",
-                moeda(reforma["tributo_bruto"]),
-                perc(reforma["aliquota"]),
-            ),
-            (
-                "Crédito estimado",
-                moeda(reforma["credito"]),
-                perc(credito_pct),
-            ),
-            (
-                "Lucro pós-reforma",
-                moeda(reforma["lucro"]),
-                "Após créditos",
-            ),
-        ]
-        cols = st.columns(4)
-        for c, item in zip(cols, cards):
-            with c:
-                card(*item)
+        with resumo_final_usado:
+            st.markdown(
+                f"""
+                <div class="resultado-fixo">
+                    <div class="resultado-fixo-titulo">
+                        Resultado da formação de preço
+                    </div>
+                    <div class="resultado-fixo-grid">
+                        <div class="resultado-fixo-item">
+                            <div class="resultado-fixo-label">Aluguel informado</div>
+                            <div class="resultado-fixo-valor">{moeda(aluguel)}</div>
+                        </div>
+                        <div class="resultado-fixo-item">
+                            <div class="resultado-fixo-label">Mínimo calculado</div>
+                            <div class="resultado-fixo-valor">{moeda(atual["aluguel_minimo"])}</div>
+                        </div>
+                        <div class="resultado-fixo-item">
+                            <div class="resultado-fixo-label">Referência histórica</div>
+                            <div class="resultado-fixo-valor">{moeda(preco_historico_sugerido)}</div>
+                        </div>
+                        <div class="resultado-fixo-item">
+                            <div class="resultado-fixo-label">Margem estimada</div>
+                            <div class="resultado-fixo-valor">{perc(atual["margem"])}</div>
+                        </div>
+                        <div class="resultado-fixo-item">
+                            <div class="resultado-fixo-label">Payback</div>
+                            <div class="resultado-fixo-valor">{meses(atual["payback"])}</div>
+                        </div>
+                    </div>
+                    <div class="resultado-fixo-alerta">{alerta_preco}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        parecer = (
-            f"O modelo adotado foi '{modelo_usado}'. "
-            f"O equipamento terá {perc(dep['taxa'])} de depreciação acumulada "
-            f"ao final do contrato e valor contábil estimado de "
-            f"{moeda(dep['valor_contabil'])}. O custo operacional mensal "
-            f"estimado é {moeda(custo_mensal)}, acrescido de reserva técnica "
-            f"de {perc(reserva_risco_pct)}. O aluguel mínimo recomendado é "
-            f"{moeda(atual['aluguel_minimo'])}."
-        )
-        st.markdown(
-            '<div class="section-title">Parecer</div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="parecer">{parecer}</div>',
-            unsafe_allow_html=True,
-        )
+        with st.expander(
+            "Ver memória completa do cálculo",
+            expanded=False,
+        ):
+            st.markdown(
+                '<div class="section-title">Resumo executivo</div>',
+                unsafe_allow_html=True,
+            )
+            cards = [
+                (
+                    "Aluguel mínimo",
+                    moeda(atual["aluguel_minimo"]),
+                    f"Margem {perc(margem)}",
+                ),
+                (
+                    "Custo mensal operacional",
+                    moeda(custo_mensal),
+                    "Manutenção + técnico + outros",
+                ),
+                (
+                    "Lucro atual",
+                    moeda(atual["lucro"]),
+                    "Com aluguel informado",
+                ),
+                (
+                    "Payback",
+                    meses(atual["payback"]),
+                    modelo_usado,
+                ),
+            ]
+            cols = st.columns(4)
+            for c, item in zip(cols, cards):
+                with c:
+                    card(*item)
+
+            st.markdown(
+                '<div class="section-title">Depreciação e ativo</div>',
+                unsafe_allow_html=True,
+            )
+            cards = [
+                (
+                    "Meses já depreciados",
+                    f"{dep['meses_antes']} meses",
+                    "Antes do contrato",
+                ),
+                (
+                    "Taxa de depreciação",
+                    perc(dep["taxa"]),
+                    f"{dep['meses_finais']} meses totais",
+                ),
+                (
+                    "Valor contábil final",
+                    moeda(dep["valor_contabil"]),
+                    "Após o contrato",
+                ),
+                (
+                    "Capital recuperado",
+                    moeda(investimento_recuperar),
+                    modelo_usado,
+                ),
+            ]
+            cols = st.columns(4)
+            for c, item in zip(cols, cards):
+                with c:
+                    card(*item)
+
+            st.markdown(
+                '<div class="section-title">Atual x pós-reforma</div>',
+                unsafe_allow_html=True,
+            )
+            cards = [
+                (
+                    "Impostos atuais",
+                    moeda(atual["impostos"]),
+                    "14,30%",
+                ),
+                (
+                    "IBS/CBS bruto",
+                    moeda(reforma["tributo_bruto"]),
+                    perc(reforma["aliquota"]),
+                ),
+                (
+                    "Crédito estimado",
+                    moeda(reforma["credito"]),
+                    perc(credito_pct),
+                ),
+                (
+                    "Lucro pós-reforma",
+                    moeda(reforma["lucro"]),
+                    "Após créditos",
+                ),
+            ]
+            cols = st.columns(4)
+            for c, item in zip(cols, cards):
+                with c:
+                    card(*item)
+
+            parecer = (
+                f"O modelo adotado foi '{modelo_usado}'. "
+                f"O equipamento terá {perc(dep['taxa'])} de depreciação acumulada "
+                f"ao final do contrato e valor contábil estimado de "
+                f"{moeda(dep['valor_contabil'])}. O custo operacional mensal "
+                f"estimado é {moeda(custo_mensal)}, acrescido de reserva técnica "
+                f"de {perc(reserva_risco_pct)}. O aluguel mínimo recomendado é "
+                f"{moeda(atual['aluguel_minimo'])}."
+            )
+            st.markdown(
+                '<div class="section-title">Parecer</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div class="parecer">{parecer}</div>',
+                unsafe_allow_html=True,
+            )
+
 
         detalhes_proposta_usado = {
             "modelo_precificacao": modelo_usado,
@@ -4228,6 +4496,13 @@ elif menu == "3 - Formação de Preço - Usados":
             "valor_hora_tecnica": valor_hora,
             "deslocamento_mensal": deslocamento,
             "reserva_risco_pct": reserva_risco_pct,
+            "preco_historico_sugerido": preco_historico_sugerido,
+            "quantidade_referencias_historicas": (
+                analise_historica_usado["quantidade"]
+            ),
+            "preco_mediano_historico": (
+                analise_historica_usado["mediana"]
+            ),
             "comissao_vendedor_pct": cv,
             "comissao_gerente_pct": cg,
             "comissao_representante_pct": cr,
@@ -4254,10 +4529,10 @@ elif menu == "3 - Formação de Preço - Usados":
         col1, col2 = st.columns(2)
         with col1:
             st.download_button(
-                "Baixar proposta em PDF",
+                "Baixar análise interna em PDF",
                 data=proposta_pdf_usado,
                 file_name=(
-                    f"proposta_locacao_usado_"
+                    f"analise_interna_locacao_usado_"
                     f"{_slug_widget(cliente or equipamento or 'cliente')}.pdf"
                 ),
                 mime="application/pdf",
