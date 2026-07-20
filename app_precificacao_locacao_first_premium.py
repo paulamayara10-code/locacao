@@ -1994,24 +1994,20 @@ def calcular_depreciacao(valor, data_aquisicao, data_inicio, prazo, vida_anos):
 
 
 def taxa_manutencao_por_depreciacao(depreciacao_atual_pct):
-    """Reserva anual de manutenção para equipamentos usados.
-
-    A curva é deliberadamente conservadora para evitar preços muito baixos.
-    Todos os percentuais permanecem editáveis na cotação.
-    """
+    """Percentual anual aplicado sobre o valor econômico atual."""
     if depreciacao_atual_pct <= 20:
         return 4.0
     if depreciacao_atual_pct <= 40:
-        return 6.0
+        return 5.0
     if depreciacao_atual_pct <= 60:
-        return 8.0
+        return 6.0
     if depreciacao_atual_pct <= 80:
-        return 12.0
-    return 15.0
+        return 7.0
+    return 8.0
 
 
 def horas_tecnicas_por_depreciacao(depreciacao_atual_pct):
-    """Estimativa conservadora de horas técnicas mensais."""
+    """Estimativa inicial de horas técnicas mensais."""
     if depreciacao_atual_pct <= 20:
         return 2.0
     if depreciacao_atual_pct <= 40:
@@ -2019,8 +2015,36 @@ def horas_tecnicas_por_depreciacao(depreciacao_atual_pct):
     if depreciacao_atual_pct <= 60:
         return 4.0
     if depreciacao_atual_pct <= 80:
-        return 6.0
-    return 8.0
+        return 5.0
+    return 6.0
+
+
+def fator_conservacao_usado(estado):
+    return {
+        "Excelente": 0.80,
+        "Bom": 1.00,
+        "Regular": 1.25,
+    }.get(estado, 1.00)
+
+
+def base_manutencao_usado(valor_aquisicao, valor_contabil):
+    """Valor atual do ativo, com piso residual de 20% do original."""
+    valor_aquisicao = max(float(valor_aquisicao or 0), 0.0)
+    valor_contabil = max(float(valor_contabil or 0), 0.0)
+    return max(valor_contabil, valor_aquisicao * 0.20)
+
+
+def fatores_faixa_preco_usado(depreciacao_atual_pct):
+    """A proteção adicional cai gradualmente conforme a depreciação."""
+    if depreciacao_atual_pct <= 20:
+        return 1.15, 1.25
+    if depreciacao_atual_pct <= 40:
+        return 1.12, 1.22
+    if depreciacao_atual_pct <= 60:
+        return 1.10, 1.20
+    if depreciacao_atual_pct <= 80:
+        return 1.08, 1.18
+    return 1.05, 1.15
 
 
 def simulacao_base_usado(
@@ -2051,7 +2075,13 @@ def simulacao_base_usado(
     )
 
     taxa_anual = taxa_manutencao_por_depreciacao(dep_atual["taxa"])
-    manutencao_mensal = valor_ativo * taxa_anual / 100 / 12
+    base_manutencao = base_manutencao_usado(
+        valor_ativo,
+        dep_atual["valor_contabil"],
+    )
+    manutencao_mensal = (
+        base_manutencao * taxa_anual / 100 / 12
+    )
 
     depreciacao_contrato = max(
         dep_final["depreciacao"] - dep_atual["depreciacao"],
@@ -2079,6 +2109,7 @@ def simulacao_base_usado(
         "depreciacao_atual": dep_atual["taxa"],
         "depreciacao_final": dep_final["taxa"],
         "taxa_manutencao_anual": taxa_anual,
+        "base_manutencao": base_manutencao,
         "manutencao_mensal": manutencao_mensal,
         "horas_tecnicas": horas_tecnicas_por_depreciacao(
             dep_atual["taxa"]
@@ -2834,6 +2865,7 @@ if st.sidebar.button("Limpar dados desta tela", use_container_width=True):
         "usado_observacoes_proposta",
         "usado_aval_gerencia",
         "usado_justificativa_negociacao",
+        "usado_estado_conservacao",
     }
 
     for _key in list(st.session_state.keys()):
@@ -4054,8 +4086,20 @@ elif menu == "3 - Formação de Preço - Usados":
             dep_atual_form["taxa"]
         )
 
-        col1, col2 = st.columns(2)
-        taxa_manutencao_anual = col1.number_input(
+        col1, col2, col3 = st.columns(3)
+
+        estado_conservacao = col1.selectbox(
+            "Estado de conservação",
+            ["Excelente", "Bom", "Regular"],
+            index=1,
+            key="usado_estado_conservacao",
+        )
+
+        fator_conservacao = fator_conservacao_usado(
+            estado_conservacao
+        )
+
+        taxa_manutencao_anual = col2.number_input(
             "Reserva anual de manutenção (%)",
             min_value=0.0,
             value=float(taxa_manut_sugerida),
@@ -4063,23 +4107,31 @@ elif menu == "3 - Formação de Preço - Usados":
             key="u_taxa_manutencao_anual",
         )
 
-        usar_manutencao_automatica = col2.checkbox(
-            "Calcular manutenção automaticamente",
+        usar_manutencao_automatica = col3.checkbox(
+            "Calcular automaticamente",
             value=True,
             key="u_usar_manut_auto",
         )
 
+        base_manutencao = base_manutencao_usado(
+            valor_ativo,
+            dep_atual_form["valor_contabil"],
+        )
+
         manutencao_calculada = (
-            valor_ativo
+            base_manutencao
             * taxa_manutencao_anual
             / 100
             / 12
+            * fator_conservacao
         )
 
         if usar_manutencao_automatica:
             manutencao = manutencao_calculada
             st.info(
-                f"Manutenção mensal considerada: {moeda(manutencao)}"
+                f"Manutenção mensal considerada: {moeda(manutencao)} | "
+                f"Base econômica: {moeda(base_manutencao)} | "
+                f"Conservação: {estado_conservacao}"
             )
         else:
             manutencao = input_rs_compacto(
@@ -4191,7 +4243,12 @@ elif menu == "3 - Formação de Preço - Usados":
         col1.metric("Custo mensal", moeda(custo_mensal))
         col2.metric("Custo do contrato", moeda(custo_operacional))
         col3.metric("Reserva de risco", moeda(reserva_risco))
-        col4.metric("Custo técnico mensal", moeda(custo_tecnico))
+        col4.metric("Base de manutenção", moeda(base_manutencao))
+
+        st.caption(
+            "O risco técnico aumenta com a idade, mas a manutenção "
+            "é calculada sobre o valor econômico atual do equipamento."
+        )
 
     with etapa_3:
         st.markdown(
@@ -4269,8 +4326,20 @@ elif menu == "3 - Formação de Preço - Usados":
         )
 
         preco_minimo = resultado_base["aluguel_minimo"]
-        preco_recomendado = preco_minimo * 1.10
-        preco_seguro = preco_minimo * 1.20
+
+        (
+            fator_preco_recomendado,
+            fator_preco_protegido,
+        ) = fatores_faixa_preco_usado(
+            dep_atual_form["taxa"]
+        )
+
+        preco_recomendado = (
+            preco_minimo * fator_preco_recomendado
+        )
+        preco_seguro = (
+            preco_minimo * fator_preco_protegido
+        )
 
         st.markdown(
             '<div class="section-title">Valor em negociação</div>',
@@ -4394,7 +4463,10 @@ elif menu == "3 - Formação de Preço - Usados":
                 card(
                     "Preço recomendado",
                     moeda(preco_recomendado),
-                    "Faixa indicada para a negociação",
+                    (
+                        f"Proteção de "
+                        f"{perc((fator_preco_recomendado - 1) * 100)}"
+                    ),
                 )
                 st.button(
                     "Usar como contraproposta",
@@ -4408,7 +4480,10 @@ elif menu == "3 - Formação de Preço - Usados":
                 card(
                     "Preço protegido",
                     moeda(preco_seguro),
-                    "Maior proteção contra riscos",
+                    (
+                        f"Proteção de "
+                        f"{perc((fator_preco_protegido - 1) * 100)}"
+                    ),
                 )
                 st.button(
                     "Usar como contraproposta",
@@ -4563,6 +4638,9 @@ elif menu == "3 - Formação de Preço - Usados":
         "depreciacao_atual_pct": dep_atual_form["taxa"],
         "depreciacao_final_pct": dep["taxa"],
         "valor_contabil_final": dep["valor_contabil"],
+        "estado_conservacao": estado_conservacao,
+        "fator_conservacao": fator_conservacao,
+        "base_economica_manutencao": base_manutencao,
         "manutencao_mensal": manutencao,
         "pecas_mensais": pecas,
         "seguro_mensal": seguro,
@@ -4814,6 +4892,9 @@ elif menu == "3 - Formação de Preço - Usados":
             f"A margem estimada para o valor negociado é "
             f"{perc(atual['margem'])}, com payback de "
             f"{meses(atual['payback'])}. "
+            f"A manutenção considera a base econômica de "
+            f"{moeda(base_manutencao)} e conservação "
+            f"{estado_conservacao}. "
             f"Aval da gerência: {aval_gerencia_usado}."
         )
 
@@ -4859,6 +4940,9 @@ elif menu == "3 - Formação de Preço - Usados":
                         "observacao_referencia": (
                             observacoes_proposta_usado
                         ),
+                        "estado_conservacao": estado_conservacao,
+                        "fator_conservacao": fator_conservacao,
+                        "base_economica_manutencao": base_manutencao,
                         "manutencao": manutencao,
                         "manutencao_automatica": (
                             usar_manutencao_automatica
@@ -5031,7 +5115,22 @@ elif menu == "6 - Configurações de Cálculo":
             ["Vida útil inicial do equipamento", "10 anos"],
             ["Simulação após a reforma tributária", "Percentuais de CBS, IBS e créditos podem ser ajustados"],
             ["Equipamentos usados", "Considera manutenção, atendimento técnico, risco e recuperação do valor do ativo"],
-            ["Manutenção sugerida", "Aumenta conforme o equipamento se aproxima do fim da vida útil"],
+            [
+                "Manutenção de equipamentos usados",
+                "De 4% a 8% ao ano sobre o valor econômico atual",
+            ],
+            [
+                "Estado de conservação",
+                "Excelente reduz 20%, bom mantém e regular aumenta 25%",
+            ],
+            [
+                "Base da manutenção",
+                "Valor contábil atual, com piso de 20% do valor original",
+            ],
+            [
+                "Faixas comerciais dos usados",
+                "A proteção adicional diminui conforme a depreciação",
+            ],
         ],
         columns=["Critério", "Como o sistema considera"],
     )
