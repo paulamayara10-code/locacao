@@ -132,7 +132,7 @@ BASE_BI_GIT_ALTERNATIVAS = [
 # Sempre que a regra de leitura da BASE BI mudar, altere esta versão.
 # Isso força a limpeza e a reconstrução das referências importadas.
 BASE_BI_REGRA_IMPORTACAO = (
-    "V30_NOVA_LOCACAO_VALOR_BRUTO_POR_QUANTIDADE"
+    "V31_NOVA_LOCACAO_DIRETO_CENTRAL_VALOR_BRUTO"
 )
 
 IMPOSTO_ATUAL = 14.30
@@ -472,7 +472,10 @@ def migrar_referencias_historicas_para_pricing():
     for _, row in legadas.iterrows():
         fonte = texto_limpo(row.get("fonte"))
         tipo_ref = texto_limpo(row.get("tipo_referencia"))
-        faturada = "FATURAMENTO" in normalizar_texto_coluna(fonte)
+        faturada = (
+            "FATUR" in normalizar_texto_coluna(fonte)
+            or "FATUR" in normalizar_texto_coluna(tipo_ref)
+        )
         status = "Faturada" if faturada else "Contratada"
         tipo_fonte = (
             "Faturamento real"
@@ -977,25 +980,19 @@ def importar_controle_contratos(arquivo):
     return salvar_referencias(regs)
 
 def importar_base_bi(arquivo):
-    """Importa o histórico de preços de locação da BASE BI.
+    """Leva os preços faturados de locação diretamente à Central.
 
-    A coluna NOVA define a natureza da operação. Somente as linhas
-    classificadas como LOCAÇÃO entram na central de consulta.
-
-    O VALOR BRUTO é a única referência financeira utilizada:
-    - valor mensal total = VALOR BRUTO;
-    - preço mensal por equipamento = VALOR BRUTO / QUANTIDADE.
+    Regras adotadas:
+    - somente linhas com NOVA = LOCAÇÃO;
+    - valor total da referência = VALOR BRUTO;
+    - preço por equipamento = VALOR BRUTO / QUANTIDADE;
+    - linhas sem cliente, produto ou valor bruto positivo são descartadas.
     """
-    abas = pd.read_excel(
-        arquivo,
-        sheet_name=None,
-        engine="openpyxl",
-    )
-
+    excel = pd.ExcelFile(arquivo, engine="openpyxl")
     nome = next(
         (
             nome_aba
-            for nome_aba in abas
+            for nome_aba in excel.sheet_names
             if "BANCO DE DADOS FATURAMENTO"
             in normalizar_texto_coluna(nome_aba)
         ),
@@ -1007,7 +1004,12 @@ def importar_base_bi(arquivo):
             "A planilha de faturamento não foi encontrada na BASE BI."
         )
 
-    df = abas[nome].dropna(how="all").copy()
+    # Carrega somente a aba necessária, evitando abrir as demais abas.
+    df = pd.read_excel(
+        arquivo,
+        sheet_name=nome,
+        engine="openpyxl",
+    ).dropna(how="all")
 
     c = {
         chave: localizar_coluna(df, alternativas)
@@ -1016,7 +1018,7 @@ def importar_base_bi(arquivo):
             "data": ["DT EMISSAO", "DT EMISSÃO"],
             "cod": ["CLIENTE"],
             "cliente": ["NOME DO CLIENTE"],
-            "resp": ["VENDEDOR / REPRESENTANTE"],
+            "resp": ["VENDEDOR / REPRESENTANTE", "VENDEDOR"],
             "produto": ["PRODUTO"],
             "desc": ["DESCRIÇÃO", "DESCRICAO"],
             "qtd": ["QUANTIDADE"],
@@ -1035,27 +1037,26 @@ def importar_base_bi(arquivo):
         c["produto"],
         c["bruto"],
     ]
-
     if any(coluna is None for coluna in obrigatorias):
         raise ValueError(
-            "A BASE BI precisa conter as colunas NOVA, "
-            "NOME DO CLIENTE, PRODUTO e VALOR BRUTO."
+            "A BASE BI precisa conter NOVA, NOME DO CLIENTE, "
+            "PRODUTO e VALOR BRUTO."
         )
 
-    natureza_operacao = (
+    natureza = (
         df[c["nova"]]
         .fillna("")
         .astype(str)
         .map(normalizar_texto_coluna)
     )
-
-    df = df[natureza_operacao.eq("LOCACAO")].copy()
+    df = df[natureza.eq("LOCACAO")].copy()
 
     agora = datetime.now(
         ZoneInfo("America/Sao_Paulo")
     ).strftime("%d/%m/%Y %H:%M:%S")
 
-    registros = []
+    registros_historicos = []
+    referencias_central = []
 
     for _, row in df.iterrows():
         cliente = texto_limpo(row.get(c["cliente"]))
@@ -1075,6 +1076,11 @@ def importar_base_bi(arquivo):
             if c["numero"]
             else ""
         )
+        data_referencia = (
+            data_excel_para_br(row.get(c["data"]))
+            if c["data"]
+            else ""
+        )
 
         quantidade = (
             numero_limpo(row.get(c["qtd"]))
@@ -1089,72 +1095,127 @@ def importar_base_bi(arquivo):
         if not cliente or not produto or valor_bruto <= 0:
             continue
 
-        preco_unitario_bruto = valor_bruto / quantidade
+        preco_por_equipamento = valor_bruto / quantidade
+        equipamento = descricao or produto
+        linha = (
+            texto_limpo(row.get(c["linha"]))
+            if c["linha"]
+            else ""
+        )
+        vendedor = (
+            texto_limpo(row.get(c["resp"]))
+            if c["resp"]
+            else ""
+        )
+        gerente = (
+            texto_limpo(row.get(c["gerente"]))
+            if c["gerente"]
+            else ""
+        )
+        cliente_codigo = (
+            texto_limpo(row.get(c["cod"]))
+            if c["cod"]
+            else ""
+        )
+        fornecedor = (
+            texto_limpo(row.get(c["fornecedor"]))
+            if c["fornecedor"]
+            else ""
+        )
 
-        registros.append(
+        chave_base = chave_historica(
+            BASE_BI_REGRA_IMPORTACAO,
+            nota,
+            numero,
+            produto,
+            cliente,
+            quantidade,
+            valor_bruto,
+        )
+
+        registros_historicos.append(
             {
-                "chave_unica": chave_historica(
-                    BASE_BI_REGRA_IMPORTACAO,
-                    nota,
-                    numero,
-                    produto,
-                    cliente,
-                    quantidade,
-                    valor_bruto,
-                ),
+                "chave_unica": chave_base,
                 "data_importacao": agora,
                 "fonte": "BASE BI - Locação faturada",
                 "tipo_referencia": "Preço faturado",
                 "identificador": numero,
-                "data_referencia": (
-                    data_excel_para_br(row.get(c["data"]))
-                    if c["data"]
-                    else ""
-                ),
-                "cliente_codigo": (
-                    texto_limpo(row.get(c["cod"]))
-                    if c["cod"]
-                    else ""
-                ),
+                "data_referencia": data_referencia,
+                "cliente_codigo": cliente_codigo,
                 "cliente": cliente,
                 "cnpj": "",
                 "equipamento_codigo": produto,
-                "equipamento": descricao or produto,
-                "linha_produto": (
-                    texto_limpo(row.get(c["linha"]))
-                    if c["linha"]
-                    else ""
-                ),
+                "equipamento": equipamento,
+                "linha_produto": linha,
                 "quantidade": quantidade,
-                "valor_unitario": preco_unitario_bruto,
+                "valor_unitario": preco_por_equipamento,
                 "valor_mensal": valor_bruto,
                 "valor_total": valor_bruto,
-                "vendedor": (
-                    texto_limpo(row.get(c["resp"]))
-                    if c["resp"]
-                    else ""
-                ),
-                "gerente": (
-                    texto_limpo(row.get(c["gerente"]))
-                    if c["gerente"]
-                    else ""
-                ),
+                "vendedor": vendedor,
+                "gerente": gerente,
                 "sla": "",
-                "origem_contrato": (
-                    texto_limpo(row.get(c["fornecedor"]))
-                    if c["fornecedor"]
-                    else ""
-                ),
+                "origem_contrato": fornecedor,
                 "nota_fiscal": nota,
                 "observacao": (
-                    "Locação identificada pela coluna NOVA. "
-                    "Preço total conforme VALOR BRUTO e preço por "
-                    "equipamento calculado pela quantidade faturada."
+                    "Preço faturado de locação. Valor total conforme "
+                    "VALOR BRUTO e valor por equipamento conforme quantidade."
                 ),
             }
         )
 
-    return salvar_referencias(registros)
+        # Grava diretamente na tabela consultada pela Central de Preços.
+        referencias_central.append(
+            {
+                "chave_unica": "BASEBI|" + chave_base,
+                "data_referencia": data_referencia,
+                "fonte": "BASE BI - Locação faturada",
+                "tipo_fonte": "Faturamento real",
+                "confianca_pct": 100.0,
+                "status": "Faturada",
+                "equipamento_codigo": produto,
+                "equipamento": equipamento,
+                "fabricante": fornecedor,
+                "linha_produto": linha,
+                "condicao": "Não informado",
+                "origem_produto": "Não informado",
+                "cliente_codigo": cliente_codigo,
+                "cliente": cliente,
+                "uf": "",
+                "prazo_meses": None,
+                "quantidade": quantidade,
+                "preco_mensal_unitario": preco_por_equipamento,
+                "valor_mensal_total": valor_bruto,
+                "valor_investimento": None,
+                "aluguel_minimo_calculado": None,
+                "margem_pct": None,
+                "payback_meses": None,
+                "vendedor": vendedor,
+                "gerente": gerente,
+                "representante": "",
+                "nota_fiscal": nota,
+                "contrato": "",
+                "simulacao_id": None,
+                "observacao": (
+                    "Referência real de locação faturada, obtida da BASE BI."
+                ),
+            }
+        )
+
+    resultado_historico = salvar_referencias(
+        registros_historicos
+    )
+    resultado_central = salvar_referencias_preco_lote(
+        referencias_central
+    )
+
+    return {
+        "inseridos": resultado_historico["inseridos"],
+        "ignorados": resultado_historico["ignorados"],
+        "central_inseridos": resultado_central["inseridos"],
+        "central_ignorados": resultado_central["ignorados"],
+        "linhas_locacao": int(len(df)),
+        "referencias_validas": int(len(referencias_central)),
+    }
 
 
 def localizar_base_bi_git():
@@ -1442,8 +1503,10 @@ def sincronizar_base_bi_git():
         return {
             "status": "Importada",
             "mensagem": (
-                f"{resultado['inseridos']} novos registros importados; "
-                f"{resultado['ignorados']} duplicados ignorados."
+                f"{resultado.get('central_inseridos', resultado['inseridos'])} "
+                "preços disponibilizados para consulta; "
+                f"{resultado.get('central_ignorados', resultado['ignorados'])} "
+                "registros repetidos ignorados."
             ),
             "caminho": str(caminho),
             "inseridos": resultado["inseridos"],
@@ -2325,6 +2388,33 @@ status_base_bi_git, status_central_pricing = (
     inicializar_bases_pricing()
 )
 
+# Caso uma versão anterior tenha registrado a atualização sem alimentar
+# a Central, reconstrói as referências automaticamente uma única vez.
+if contar_registros_tabela("referencias_preco") == 0:
+    _base_para_recuperacao = localizar_base_bi_git()
+    if _base_para_recuperacao is not None:
+        try:
+            _resultado_recuperacao = importar_base_bi(
+                _base_para_recuperacao
+            )
+            status_central_pricing = sincronizar_central_pricing(
+                forcar=True
+            )
+            status_base_bi_git = {
+                **status_base_bi_git,
+                "status": "Importada",
+                "mensagem": (
+                    f"{_resultado_recuperacao.get('central_inseridos', 0)} "
+                    "preços carregados para consulta."
+                ),
+            }
+        except Exception as _erro_recuperacao:
+            status_base_bi_git = {
+                **status_base_bi_git,
+                "status": "Erro",
+                "mensagem": str(_erro_recuperacao),
+            }
+
 # ======================================================
 # MENU
 # ======================================================
@@ -2552,11 +2642,47 @@ elif menu == "1 - Central de Consulta":
 
     refs = referencias_preco()
     if refs.empty:
-        st.info(
-            "Ainda não existem referências de preço. A BASE BI, os contratos e "
-            "as simulações salvas alimentarão esta central automaticamente."
-        )
+        if status_base_bi_git.get("status") == "Ausente":
+            st.warning(
+                "A BASE BI não foi encontrada. Inclua o arquivo "
+                "base_bi.xlsx na raiz do repositório para carregar "
+                "os preços já faturados."
+            )
+        else:
+            st.warning(
+                "A base foi localizada, mas os preços ainda não foram "
+                "carregados para consulta."
+            )
+            if status_base_bi_git.get("mensagem"):
+                st.caption(status_base_bi_git["mensagem"])
+
+        if st.button(
+            "Carregar histórico de preços agora",
+            use_container_width=True,
+            key="central_recarregar_historico",
+        ):
+            _hash_sha256_cache.clear()
+            inicializar_bases_pricing.clear()
+            caminho_base = localizar_base_bi_git()
+            if caminho_base is None:
+                st.error("O arquivo base_bi.xlsx não foi encontrado.")
+            else:
+                try:
+                    with st.spinner("Carregando os preços de locação..."):
+                        importar_base_bi(caminho_base)
+                        sincronizar_central_pricing(forcar=True)
+                    st.success("Histórico de preços carregado.")
+                    st.rerun()
+                except Exception as erro:
+                    st.error(
+                        "Não foi possível carregar o histórico: "
+                        f"{erro}"
+                    )
     else:
+        st.caption(
+            f"{len(refs):,} referências disponíveis para consulta."
+            .replace(",", ".")
+        )
         col1, col2 = st.columns([2, 1])
         busca = col1.text_input(
             "Buscar por código, equipamento, fabricante ou linha",
