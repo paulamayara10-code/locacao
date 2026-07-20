@@ -1823,6 +1823,94 @@ def input_rs_compacto(label, value, key, help_text=None):
     return parse(texto)
 
 
+def aplicar_valor_monetario(chave, valor):
+    """Atualiza um campo monetário por callback, antes do novo render."""
+    st.session_state[chave] = moeda(valor)
+
+
+def avaliar_preco_negociado(
+    aluguel,
+    preco_minimo,
+    preco_recomendado,
+    preco_protegido,
+):
+    """Classifica a condição comercial informada pelo vendedor."""
+    aluguel = float(aluguel or 0)
+    preco_minimo = float(preco_minimo or 0)
+    preco_recomendado = float(preco_recomendado or 0)
+    preco_protegido = float(preco_protegido or 0)
+
+    if aluguel <= 0:
+        return {
+            "classificacao": "Informe o valor",
+            "nivel": "neutro",
+            "mensagem": (
+                "Digite o aluguel que está sendo negociado para receber "
+                "a avaliação da operação."
+            ),
+            "exige_aval": False,
+        }
+
+    if aluguel < preco_minimo:
+        falta = preco_minimo - aluguel
+        pct = (
+            falta / preco_minimo * 100
+            if preco_minimo > 0
+            else 0
+        )
+        return {
+            "classificacao": "Não recomendado",
+            "nivel": "critico",
+            "mensagem": (
+                f"O valor está {moeda(falta)} ({perc(pct)}) abaixo do "
+                "mínimo necessário. A operação exige justificativa e "
+                "aval expresso da gerência."
+            ),
+            "exige_aval": True,
+        }
+
+    if aluguel < preco_recomendado:
+        falta = preco_recomendado - aluguel
+        pct = (
+            falta / preco_recomendado * 100
+            if preco_recomendado > 0
+            else 0
+        )
+        return {
+            "classificacao": "Viável com atenção",
+            "nivel": "atencao",
+            "mensagem": (
+                f"A operação cobre o mínimo, mas está {moeda(falta)} "
+                f"({perc(pct)}) abaixo da faixa recomendada. "
+                "Solicite aval da gerência antes de liberar."
+            ),
+            "exige_aval": True,
+        }
+
+    if aluguel < preco_protegido:
+        ganho = aluguel - preco_recomendado
+        return {
+            "classificacao": "Boa negociação",
+            "nivel": "bom",
+            "mensagem": (
+                f"O valor está dentro da faixa recomendada e possui "
+                f"{moeda(ganho)} de proteção acima da referência."
+            ),
+            "exige_aval": False,
+        }
+
+    ganho = aluguel - preco_protegido
+    return {
+        "classificacao": "Excelente negociação",
+        "nivel": "excelente",
+        "mensagem": (
+            f"O valor alcançou a faixa protegida e está "
+            f"{moeda(ganho)} acima dela."
+        ),
+        "exige_aval": False,
+    }
+
+
 def card(label, value, help_text):
     st.markdown(
         f"""
@@ -2744,6 +2832,8 @@ if st.sidebar.button("Limpar dados desta tela", use_container_width=True):
         "usado_validade_proposta",
         "usado_status_referencia",
         "usado_observacoes_proposta",
+        "usado_aval_gerencia",
+        "usado_justificativa_negociacao",
     }
 
     for _key in list(st.session_state.keys()):
@@ -4183,59 +4273,150 @@ elif menu == "3 - Formação de Preço - Usados":
         preco_seguro = preco_minimo * 1.20
 
         st.markdown(
-            '<div class="section-title">Faixas sugeridas</div>',
+            '<div class="section-title">Valor em negociação</div>',
             unsafe_allow_html=True,
         )
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            card(
-                "Preço mínimo",
-                moeda(preco_minimo),
-                "Atende à margem informada",
-            )
-            usar_minimo = st.button(
-                "Aplicar preço mínimo",
-                use_container_width=True,
-                key="usado_aplicar_minimo",
-            )
-
-        with col2:
-            card(
-                "Preço recomendado",
-                moeda(preco_recomendado),
-                "10% de proteção adicional",
-            )
-            usar_recomendado = st.button(
-                "Aplicar recomendado",
-                use_container_width=True,
-                key="usado_aplicar_recomendado",
-            )
-
-        with col3:
-            card(
-                "Preço protegido",
-                moeda(preco_seguro),
-                "20% de proteção adicional",
-            )
-            usar_seguro = st.button(
-                "Aplicar preço protegido",
-                use_container_width=True,
-                key="usado_aplicar_seguro",
-            )
-
-        if usar_minimo:
-            st.session_state["u_aluguel"] = moeda(preco_minimo)
-        elif usar_recomendado:
-            st.session_state["u_aluguel"] = moeda(preco_recomendado)
-        elif usar_seguro:
-            st.session_state["u_aluguel"] = moeda(preco_seguro)
 
         aluguel = input_rs_compacto(
-            "Aluguel mensal escolhido",
+            "Aluguel mensal negociado pelo vendedor",
             preco_recomendado,
             "u_aluguel",
+            (
+                "Digite o valor que está sendo tratado com o cliente. "
+                "O sistema avaliará a condição imediatamente."
+            ),
         )
+
+        resultado_negociacao = calcular_resultado(
+            investimento_recuperar,
+            int(prazo),
+            aluguel,
+            custo_operacional,
+            IMPOSTO_ATUAL,
+            com_pct,
+            margem,
+            0.0,
+            reserva_risco,
+        )
+
+        avaliacao_negociacao = avaliar_preco_negociado(
+            aluguel,
+            preco_minimo,
+            preco_recomendado,
+            preco_seguro,
+        )
+
+        if avaliacao_negociacao["nivel"] == "critico":
+            st.error(
+                f"**{avaliacao_negociacao['classificacao']}** — "
+                f"{avaliacao_negociacao['mensagem']}"
+            )
+        elif avaliacao_negociacao["nivel"] == "atencao":
+            st.warning(
+                f"**{avaliacao_negociacao['classificacao']}** — "
+                f"{avaliacao_negociacao['mensagem']}"
+            )
+        elif avaliacao_negociacao["nivel"] == "bom":
+            st.success(
+                f"**{avaliacao_negociacao['classificacao']}** — "
+                f"{avaliacao_negociacao['mensagem']}"
+            )
+        elif avaliacao_negociacao["nivel"] == "excelente":
+            st.success(
+                f"**{avaliacao_negociacao['classificacao']}** — "
+                f"{avaliacao_negociacao['mensagem']}"
+            )
+        else:
+            st.info(avaliacao_negociacao["mensagem"])
+
+        diferenca_minimo = aluguel - preco_minimo
+        diferenca_recomendado = aluguel - preco_recomendado
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric(
+            "Valor negociado",
+            moeda(aluguel),
+        )
+        col2.metric(
+            "Diferença para o mínimo",
+            moeda(diferenca_minimo),
+            delta=(
+                "Acima do mínimo"
+                if diferenca_minimo >= 0
+                else "Abaixo do mínimo"
+            ),
+            delta_color=(
+                "normal"
+                if diferenca_minimo >= 0
+                else "inverse"
+            ),
+        )
+        col3.metric(
+            "Diferença para o recomendado",
+            moeda(diferenca_recomendado),
+            delta=(
+                "Dentro da faixa"
+                if diferenca_recomendado >= 0
+                else "Abaixo da faixa"
+            ),
+            delta_color=(
+                "normal"
+                if diferenca_recomendado >= 0
+                else "inverse"
+            ),
+        )
+        col4.metric(
+            "Margem desta negociação",
+            perc(resultado_negociacao["margem"]),
+        )
+
+        with st.expander(
+            "Comparar com outras faixas de preço",
+            expanded=False,
+        ):
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                card(
+                    "Preço mínimo",
+                    moeda(preco_minimo),
+                    "Menor valor financeiramente aceitável",
+                )
+                st.button(
+                    "Usar como contraproposta",
+                    use_container_width=True,
+                    key="usado_aplicar_minimo",
+                    on_click=aplicar_valor_monetario,
+                    args=("u_aluguel", preco_minimo),
+                )
+
+            with col2:
+                card(
+                    "Preço recomendado",
+                    moeda(preco_recomendado),
+                    "Faixa indicada para a negociação",
+                )
+                st.button(
+                    "Usar como contraproposta",
+                    use_container_width=True,
+                    key="usado_aplicar_recomendado",
+                    on_click=aplicar_valor_monetario,
+                    args=("u_aluguel", preco_recomendado),
+                )
+
+            with col3:
+                card(
+                    "Preço protegido",
+                    moeda(preco_seguro),
+                    "Maior proteção contra riscos",
+                )
+                st.button(
+                    "Usar como contraproposta",
+                    use_container_width=True,
+                    key="usado_aplicar_seguro",
+                    on_click=aplicar_valor_monetario,
+                    args=("u_aluguel", preco_seguro),
+                )
 
         with st.expander(
             "Simulação após a reforma tributária",
@@ -4263,9 +4444,10 @@ elif menu == "3 - Formação de Preço - Usados":
 
         with st.expander(
             "Informações para aprovação",
-            expanded=False,
+            expanded=avaliacao_negociacao["exige_aval"],
         ):
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
+
             validade_proposta_usado = col1.number_input(
                 "Validade da análise (dias)",
                 min_value=1,
@@ -4297,11 +4479,50 @@ elif menu == "3 - Formação de Preço - Usados":
                 key="usado_status_referencia",
             )
 
+            opcoes_aval = [
+                "Pendente",
+                "Aprovado",
+                "Reprovado",
+            ]
+            aval_gerencia_usado = col3.selectbox(
+                "Aval da gerência",
+                opcoes_aval,
+                key="usado_aval_gerencia",
+                help=(
+                    "Preços abaixo da faixa recomendada devem permanecer "
+                    "como pendentes até a decisão da gerência."
+                ),
+            )
+
+            justificativa_negociacao_usado = st.text_area(
+                (
+                    "Justificativa comercial obrigatória"
+                    if avaliacao_negociacao["exige_aval"]
+                    else "Justificativa comercial"
+                ),
+                height=85,
+                key="usado_justificativa_negociacao",
+                placeholder=(
+                    "Informe concorrência, prazo, volume, estratégia, "
+                    "cliente-chave ou outra condição da negociação."
+                ),
+            )
+
             observacoes_proposta_usado = st.text_area(
-                "Observações para a gerência",
-                height=90,
+                "Outras observações para a gerência",
+                height=75,
                 key="usado_observacoes_proposta",
             )
+
+            if (
+                avaliacao_negociacao["exige_aval"]
+                and not justificativa_negociacao_usado.strip()
+            ):
+                st.warning(
+                    "Inclua a justificativa comercial para salvar "
+                    "esta condição e encaminhá-la à gerência."
+                )
+
 
     atual = calcular_resultado(
         investimento_recuperar,
@@ -4331,22 +4552,10 @@ elif menu == "3 - Formação de Preço - Usados":
         demais_custos_reforma,
     )
 
-    if aluguel < preco_minimo:
-        alerta_preco = (
-            "Atenção: o aluguel está abaixo do preço mínimo calculado."
-        )
-    elif aluguel < preco_recomendado:
-        alerta_preco = (
-            "O valor cobre a operação, mas está abaixo da faixa recomendada."
-        )
-    elif aluguel < preco_seguro:
-        alerta_preco = (
-            "O valor está dentro da faixa recomendada."
-        )
-    else:
-        alerta_preco = (
-            "O valor possui proteção adicional para riscos da operação."
-        )
+    alerta_preco = (
+        f"{avaliacao_negociacao['classificacao']}: "
+        f"{avaliacao_negociacao['mensagem']}"
+    )
 
     detalhes_proposta_usado = {
         "modelo_precificacao": modelo_usado,
@@ -4364,10 +4573,34 @@ elif menu == "3 - Formação de Preço - Usados":
         "preco_minimo": preco_minimo,
         "preco_recomendado": preco_recomendado,
         "preco_protegido": preco_seguro,
+        "classificacao_negociacao": (
+            avaliacao_negociacao["classificacao"]
+        ),
+        "diferenca_para_minimo": diferenca_minimo,
+        "diferenca_para_recomendado": diferenca_recomendado,
+        "aval_gerencia": aval_gerencia_usado,
+        "justificativa_comercial": justificativa_negociacao_usado,
         "comissao_vendedor_pct": cv,
         "comissao_gerente_pct": cg,
         "comissao_representante_pct": cr,
     }
+
+    observacoes_pdf_usado = (
+        f"Parecer da negociação: "
+        f"{avaliacao_negociacao['classificacao']}. "
+        f"{avaliacao_negociacao['mensagem']} "
+        f"Aval da gerência: {aval_gerencia_usado}. "
+    )
+    if justificativa_negociacao_usado.strip():
+        observacoes_pdf_usado += (
+            "Justificativa comercial: "
+            f"{justificativa_negociacao_usado.strip()}. "
+        )
+    if observacoes_proposta_usado.strip():
+        observacoes_pdf_usado += (
+            "Observações adicionais: "
+            f"{observacoes_proposta_usado.strip()}"
+        )
 
     proposta_pdf_usado = gerar_proposta_pdf(
         tipo="Usado",
@@ -4383,14 +4616,20 @@ elif menu == "3 - Formação de Preço - Usados":
         comissao_pct=com_pct,
         origem_investimento="Ativo próprio",
         detalhes=detalhes_proposta_usado,
-        observacoes=observacoes_proposta_usado,
+        observacoes=observacoes_pdf_usado,
         validade_dias=validade_proposta_usado,
+    )
+
+    justificativa_ok = (
+        not avaliacao_negociacao["exige_aval"]
+        or bool(justificativa_negociacao_usado.strip())
     )
 
     pronto_para_salvar = (
         bool(equipamento.strip())
         and valor_ativo > 0
         and aluguel > 0
+        and justificativa_ok
     )
 
     salvar_usado = False
@@ -4453,11 +4692,19 @@ elif menu == "3 - Formação de Preço - Usados":
                 )
 
         with col2:
+            texto_botao_salvar = (
+                "Salvar para aval da gerência"
+                if (
+                    avaliacao_negociacao["exige_aval"]
+                    and aval_gerencia_usado == "Pendente"
+                )
+                else "Salvar análise"
+            )
             salvar_usado = st.button(
-                "Salvar análise",
+                texto_botao_salvar,
                 disabled=not pronto_para_salvar,
                 use_container_width=True,
-                key="salvar_usado_v34",
+                key="salvar_usado_v35",
             )
 
     with st.expander(
@@ -4558,12 +4805,16 @@ elif menu == "3 - Formação de Preço - Usados":
                 card(*item)
 
         parecer = (
-            f"O preço mínimo calculado é {moeda(preco_minimo)}. "
-            f"A faixa recomendada inicia em {moeda(preco_recomendado)} "
+            f"Classificação da negociação: "
+            f"{avaliacao_negociacao['classificacao']}. "
+            f"{avaliacao_negociacao['mensagem']} "
+            f"O preço mínimo calculado é {moeda(preco_minimo)}, "
+            f"a faixa recomendada inicia em {moeda(preco_recomendado)} "
             f"e a faixa protegida em {moeda(preco_seguro)}. "
-            f"O custo mensal estimado é {moeda(custo_mensal)}, "
-            f"com reserva para riscos de {perc(reserva_risco_pct)}. "
-            f"O modelo escolhido foi: {modelo_usado}."
+            f"A margem estimada para o valor negociado é "
+            f"{perc(atual['margem'])}, com payback de "
+            f"{meses(atual['payback'])}. "
+            f"Aval da gerência: {aval_gerencia_usado}."
         )
 
         st.markdown(
@@ -4626,6 +4877,23 @@ elif menu == "3 - Formação de Preço - Usados":
                         "preco_minimo": preco_minimo,
                         "preco_recomendado": preco_recomendado,
                         "preco_protegido": preco_seguro,
+                        "classificacao_negociacao": (
+                            avaliacao_negociacao["classificacao"]
+                        ),
+                        "mensagem_avaliacao": (
+                            avaliacao_negociacao["mensagem"]
+                        ),
+                        "diferenca_para_minimo": diferenca_minimo,
+                        "diferenca_para_recomendado": (
+                            diferenca_recomendado
+                        ),
+                        "exige_aval_gerencia": (
+                            avaliacao_negociacao["exige_aval"]
+                        ),
+                        "aval_gerencia": aval_gerencia_usado,
+                        "justificativa_comercial": (
+                            justificativa_negociacao_usado
+                        ),
                         "cbs": cbs,
                         "ibs": ibs,
                         "credito_pct": credito_pct,
